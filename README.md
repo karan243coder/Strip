@@ -11,7 +11,7 @@ Sirf **Stripchat family live cam record**. BIMBO / JAV / TeraBox / torrent nahi.
 - 1 / 5 / 10 / 30 min + Until Stop
 - Mouflon v2 (`keys.txt`)
 - Multi-CDN HLS, ffmpeg remux + thumb, Telegram upload
-- Private / group-show pe record nahi (HTTP 403)
+- Private / group-show coming soon
 
 ---
 
