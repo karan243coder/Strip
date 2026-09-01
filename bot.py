@@ -91,8 +91,8 @@ def main():
     threading.Thread(target=run_health, daemon=True).start()
     threading.Thread(target=_cleanup_loop, daemon=True).start()
 
-    from pyrogram import Client
-    import handlers  # noqa: F401 — registers Client handlers
+    from pyrogram import Client, idle
+    import handlers
 
     app = Client(
         name=config.SESSION_NAME,
@@ -104,13 +104,18 @@ def main():
         max_concurrent_transmissions=4,
         sleep_threshold=30,
     )
+    handlers.register(app)
     from engine import load_key_map
     km = load_key_map()
     logger.info(
         "starting | owner=%s allow_all=%s keys=%s admins=%s",
         config.OWNER_ID, config.ALLOW_ALL, len(km), len(config.ADMIN_IDS),
     )
-    app.run()
+    app.start()
+    me = app.get_me()
+    logger.info("telegram ok @%s id=%s", me.username, me.id)
+    idle()
+    app.stop()
 
 
 if __name__ == "__main__":

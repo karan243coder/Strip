@@ -32,9 +32,12 @@ def _bool(name, default=False):
 
 
 # Telegram — apna ALAG bot token (BIMBO wala mat dalna)
-BOT_TOKEN = _str("SC_BOT_TOKEN") or _str("BOT_TOKEN")
-API_ID = _int("SC_API_ID") or _int("API_ID")
-API_HASH = _str("SC_API_HASH") or _str("API_HASH")
+BOT_TOKEN = (
+    _str("SC_BOT_TOKEN") or _str("BOT_TOKEN") or _str("TELEGRAM_BOT_TOKEN")
+    or _str("TG_BOT_TOKEN") or _str("BIMBO_BOT_TOKEN")
+)
+API_ID = _int("SC_API_ID") or _int("API_ID") or _int("TG_API_ID") or _int("BIMBO_API_ID")
+API_HASH = _str("SC_API_HASH") or _str("API_HASH") or _str("TG_API_HASH") or _str("BIMBO_API_HASH")
 SESSION_NAME = _str("SC_SESSION_NAME", "stripchat_live_bot")
 
 OWNER_ID = _int("SC_OWNER_ID") or _int("OWNER_ID")
@@ -60,6 +63,9 @@ if _allowed:
 
 # true = koi bhi user record kar sakta (bandwidth heavy)
 ALLOW_ALL = _bool("SC_ALLOW_ALL", False)
+# OWNER_ID na ho to silent-dead bot na bane — pehle deploy pe reply aaye
+if not OWNER_ID and not ALLOWED_USERS and not ADMIN_IDS:
+    ALLOW_ALL = True
 
 DOWNLOAD_DIR = _str("SC_DOWNLOAD_DIR") or os.path.join(ROOT, "downloads")
 KEY_FILE = _str("STRIPCHAT_KEY_FILE") or os.path.join(ROOT, "keys.txt")

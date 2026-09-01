@@ -171,7 +171,6 @@ async def lookup_and_card(client, m: Message, model: str):
 
 
 # ---------- commands ----------
-@Client.on_message(filters.private & _cmd("start", "help"))
 async def cmd_start(client: Client, m: Message):
     uid = m.from_user.id if m.from_user else 0
     if not allowed(uid):
@@ -181,7 +180,6 @@ async def cmd_start(client: Client, m: Message):
     await m.reply_text(HELP + extra, disable_web_page_preview=True)
 
 
-@Client.on_message(filters.private & _cmd("rec", "str", "record", "cam"))
 async def cmd_rec(client: Client, m: Message):
     uid = m.from_user.id if m.from_user else 0
     if not allowed(uid):
@@ -196,7 +194,6 @@ async def cmd_rec(client: Client, m: Message):
     await lookup_and_card(client, m, model)
 
 
-@Client.on_message(filters.private & _cmd("live", "top", "strtop", "browse"))
 async def cmd_live(client: Client, m: Message):
     uid = m.from_user.id if m.from_user else 0
     if not allowed(uid):
@@ -221,7 +218,6 @@ async def cmd_live(client: Client, m: Message):
     )
 
 
-@Client.on_message(filters.private & _cmd("stop"))
 async def cmd_stop(client: Client, m: Message):
     uid = m.from_user.id if m.from_user else 0
     rec_id = _USER_ACTIVE.get(uid)
@@ -232,7 +228,6 @@ async def cmd_stop(client: Client, m: Message):
     await m.reply_text("🛑 Stop — finalize + upload ho raha hai…")
 
 
-@Client.on_message(filters.private & _cmd("mystat", "status", "recstatus"))
 async def cmd_stat(client: Client, m: Message):
     uid = m.from_user.id if m.from_user else 0
     rec_id = _USER_ACTIVE.get(uid)
@@ -246,7 +241,6 @@ async def cmd_stat(client: Client, m: Message):
     )
 
 
-@Client.on_message(filters.private & _cmd("keys"))
 async def cmd_keys(client: Client, m: Message):
     uid = m.from_user.id if m.from_user else 0
     if not is_owner(uid):
@@ -262,11 +256,10 @@ async def cmd_keys(client: Client, m: Message):
 URL_RE = re.compile(r"https?://[^\s<>]+", re.I)
 
 
-@Client.on_message(filters.private & filters.text & ~filters.regex(r"^/"))
 async def on_paste(client: Client, m: Message):
     uid = m.from_user.id if m.from_user else 0
     if not allowed(uid):
-        return
+        return await m.reply_text(deny_text())
     text = m.text or ""
     urls = URL_RE.findall(text)
     model = ""
@@ -489,7 +482,6 @@ async def start_recording(client, c: CallbackQuery, model: str, dur: int, qualit
     await c.answer("🔴 Recording start!")
 
 
-@Client.on_callback_query(filters.regex(r"^sc:"))
 async def on_cb(client: Client, c: CallbackQuery):
     data = c.data or ""
     uid = c.from_user.id if c.from_user else 0
@@ -577,3 +569,44 @@ async def on_cb(client: Client, c: CallbackQuery):
             await c.answer(str(e)[:100], show_alert=True)
         except Exception:
             pass
+
+
+async def cmd_ping(client: Client, m: Message):
+    await m.reply_text("pong ✅ bot alive")
+
+
+_KNOWN_CMDS = {
+    "start", "help", "ping", "rec", "str", "record", "cam",
+    "live", "top", "strtop", "browse", "stop", "mystat", "status", "recstatus", "keys",
+}
+
+
+async def on_unknown(client: Client, m: Message):
+    uid = m.from_user.id if m.from_user else 0
+    text = (m.text or "").strip()
+    logger.info("in uid=%s text=%s", uid, text[:120])
+    if not text.startswith("/"):
+        return
+    first = text.split()[0][1:].split("@")[0].lower()
+    if first in _KNOWN_CMDS:
+        return
+    if not allowed(uid):
+        return await m.reply_text(deny_text())
+    return await m.reply_text("Unknown command.\n\n" + HELP, disable_web_page_preview=True)
+
+
+def register(app: Client):
+    """Instance pe handlers lagao (class @Client decorator Koyeb pe silent tha)."""
+    priv = filters.private
+    app.add_handler(MessageHandler(cmd_start, priv & _cmd("start", "help")))
+    app.add_handler(MessageHandler(cmd_ping, priv & _cmd("ping")))
+    app.add_handler(MessageHandler(cmd_rec, priv & _cmd("rec", "str", "record", "cam")))
+    app.add_handler(MessageHandler(cmd_live, priv & _cmd("live", "top", "strtop", "browse")))
+    app.add_handler(MessageHandler(cmd_stop, priv & _cmd("stop")))
+    app.add_handler(MessageHandler(cmd_stat, priv & _cmd("mystat", "status", "recstatus")))
+    app.add_handler(MessageHandler(cmd_keys, priv & _cmd("keys")))
+    app.add_handler(MessageHandler(on_paste, priv & filters.text & ~filters.regex(r"^/")))
+    app.add_handler(CallbackQueryHandler(on_cb, filters.regex(r"^sc:")))
+    # last: unknown slash commands
+    app.add_handler(MessageHandler(on_unknown, priv & filters.text), group=8)
+    logger.info("handlers registered on client")

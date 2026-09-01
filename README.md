@@ -62,7 +62,9 @@ Optional:
 | `PORT` | Koyeb khud set karta hai — mat override |
 
 5. Health check: **HTTP**, path `/`, port = Koyeb `PORT` (default 8080).
-6. Deploy → bot `/start` pe reply dega.
+6. Deploy → Telegram me `/ping` then `/start`. Reply aana chahiye.
+
+**Agar bot silent ho:** Koyeb Redeploy after latest push. Logs me `telegram ok @YourBot` dikhna chahiye. `/ping` = `pong`.
 
 Koyeb disk **ephemeral** hai. Record → Telegram pe upload → local file cleanup. Restart pe pending files gayab.
 
