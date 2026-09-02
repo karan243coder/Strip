@@ -46,8 +46,8 @@ git push -u origin main
 | `SC_API_ID` | my.telegram.org se |
 | `SC_API_HASH` | my.telegram.org se |
 | `SC_OWNER_ID` | tumhara Telegram numeric id |
-   SC_MAX_REC=2
-   SC_MAX_REC_PER_USER=2
+| 'SC_MAX_REC' | 2 |
+|'SC_MAX_REC_PER_USER' | 2 |
 
 Optional:
 
