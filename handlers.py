@@ -35,6 +35,10 @@ _RECS = {}
 _USER_ACTIVE = {}
 _USER_RECS = {}  # uid -> set(rec_id)
 _START_LOCK = asyncio.Lock()
+_UPLOAD_LOCK = asyncio.Lock()
+_REMUX_LOCK = asyncio.Lock()
+_Q = []  # only if SC_MAX_REC set
+_UPLOADING = None  # model name currently uploading
 
 
 async def safe_send(client, chat_id, text, flood_sleep=True, **kw):
@@ -94,6 +98,42 @@ def vanish(msg, sec: float = 12):
     except Exception:
         pass
     return msg
+
+
+def queue_list(uid: int = None):
+    if uid is None:
+        return list(_Q)
+    return [x for x in _Q if x.get("uid") == uid]
+
+
+def dash_text(uid: int) -> str:
+    recs = []
+    for rid in list(_USER_RECS.get(uid) or []):
+        rec = _RECS.get(rid)
+        if not rec:
+            continue
+        el = int(time.time() - rec.get("t0", time.time()))
+        recs.append(f"│ 🔴 <b>{rec.get('model')}</b>  ⏱ {fmt_dur(el)}")
+    q = queue_list(uid)
+    mons = monitor.slots(uid)
+    recn = sum(1 for s in mons if (s.get("last_state") or "") in ("rec", "live") or user_recording_model(uid, s.get("model") or ""))
+    cap = int(config.MAX_REC_PER_USER or 0)
+    rec_bit = f"{len(recs)}/{cap}" if cap else str(len(recs))
+    lines = [
+        "╭─ ⟨ <b>ＤＡＳＨ</b> ⟩ ─╮",
+        f"│ rec <b>{rec_bit}</b>  q <b>{len(q)}</b>  mon <b>{len(mons)}</b>/{config.MAX_MONITORS}",
+    ]
+    if _UPLOADING:
+        lines.append(f"│ 📤 upload <b>{_UPLOADING}</b>")
+    if recs:
+        lines.extend(recs[:12])
+    else:
+        lines.append("│ 🎙 rec idle")
+    if q:
+        names = ", ".join((x.get("model") or "?")[:16] for x in q[:8])
+        lines.append(f"│ ⏳ queue: {names}")
+    lines.append("╰─ unlimited rec · safe I/O ─╯")
+    return "\n".join(lines)
 
 
 def user_rec_count(uid: int) -> int:
@@ -188,19 +228,18 @@ def neon_mon_text(uid: int) -> str:
         lines.append("│  empty — ➕ Add ya 📡 Live")
         lines.append(f"│  slots `0/{config.MAX_MONITORS}`")
     else:
-        for i, s in enumerate(sl, 1):
+        for i, s in enumerate(sl[:12], 1):
             name = s.get("model") or "?"
             stt = s.get("last_state") or "wait"
             led = {
-                "live": "🟢 REC", "rec": "🟢 REC", "wait": "🔵 WAIT",
-                "private": "🔒 GROUP",
-            }.get(stt, "🔵 WAIT")
+                "live": "🟢", "rec": "🟢", "wait": "🔵",
+                "private": "🔒",
+            }.get(stt, "🔵")
             if user_recording_model(uid, name):
-                led = "🟢 REC"
-            hits = int(s.get("hits") or 0)
-            q = s.get("quality") or "source"
-            lines.append(f"│ <b>SLOT {i}</b>  {led}")
-            lines.append(f"│  `{name}` · `{q}` · hits `{hits}`")
+                led = "🟢"
+            lines.append(f"│ {led} `{name}`")
+        if len(sl) > 12:
+            lines.append(f"│  … +{len(sl)-12} more")
     lines.append("╰─ online ⇒ auto rec ─╯")
     lines.append(f"max <b>{config.MAX_MONITORS}</b> · poll <code>{int(config.MONITOR_POLL)}s</code>")
     return "\n".join(lines)
@@ -213,7 +252,7 @@ def neon_mon_kb(uid: int):
 HELP = (
     "🔴 **Stripchat Live Recorder**\n"
     "Neeche **buttons** se chalao — cmd zaroori nahi.\n\n"
-    "📡 Live · 📌 Monitor (max 2) · 🔴 Record\n"
+    "📡 Live (Indian/Asian/…) · 📌 Monitor · 🔴 Record (unlimited)\n"
     "⏹ Stop · 📊 Status · 🔐 Admin (owner)\n\n"
     "Link paste bhi chalega. Public + group/ticket try."
 )
@@ -479,16 +518,10 @@ async def cmd_stat(client: Client, m: Message):
         rid = _USER_ACTIVE.get(uid)
         if rid and rid in _RECS:
             ids = [rid]
-    if not ids:
-        return await m.reply_text(neon_mon_text(uid), reply_markup=neon_mon_kb(uid), parse_mode=ParseMode.HTML)
-    lines = ["╭─ ⟨ <b>ＮＥＯＮ ＳＴＡＴ</b> ⟩ ─╮"]
-    for rec_id in ids:
-        rec = _RECS[rec_id]
-        el = int(time.time() - rec.get("t0", time.time()))
-        tag = "📌 mon" if rec.get("monitor") else "🎙 rec"
-        lines.append(f"│ {tag} <b>{rec.get('model')}</b>  ⏱ `{fmt_dur(el)}`")
-    lines.append("╰───────────────╯")
-    await m.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    await m.reply_text(
+        dash_text(uid) + "\n\n" + neon_mon_text(uid),
+        reply_markup=neon_mon_kb(uid), parse_mode=ParseMode.HTML,
+    )
 
 
 
@@ -639,16 +672,27 @@ async def on_paste(client: Client, m: Message):
         return vanish(await m.reply_text("Naam samajh nahi aaya. Button se phir try karo."), 12)
     text = m.text or ""
     urls = URL_RE.findall(text)
-    model = ""
+    found = []
     for u in urls:
         if is_stripchat_url(u):
-            model = model_from_input(u)
-            break
+            mm = model_from_input(u)
+            if mm and mm.lower() not in {x.lower() for x in found}:
+                found.append(mm)
+    if len(found) > 1:
+        n_ok = 0
+        for mm in found:
+            ok, _msg = await begin_recording(client, uid, mm, 0, "source")
+            if ok:
+                n_ok += 1
+        return await m.reply_text(
+            dash_text(uid) + f"\n\n📎 {n_ok}/{len(found)} until-stop rec",
+            parse_mode=ParseMode.HTML,
+        )
+    model = found[0] if found else ""
     if not model:
         model = model_from_input(text.strip())
         if not model:
             return
-        # bare username only if it looks like a handle, not a sentence
         if " " in text.strip():
             return
     await lookup_and_card(client, m, model)
@@ -682,10 +726,19 @@ def _browse_kb(models, tag, offset, total, step=8):
         nav.append(InlineKeyboardButton("➡️ Next", callback_data=f"sc:pg:{tag}:{offset+step}"))
     if nav:
         rows.append(nav)
+    row = []
+    for tname in TAGS:
+        lab = tname.upper()[:7]
+        if tname == tag:
+            lab = "✅" + lab
+        row.append(InlineKeyboardButton(lab, callback_data=f"sc:pg:{tname}:0"))
+        if len(row) == 4:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
     rows.append([
-        InlineKeyboardButton(t.upper() if t != tag else f"✅ {t.upper()}",
-                             callback_data=f"sc:pg:{t}:0")
-        for t in TAGS
+        InlineKeyboardButton("🔴 REC PAGE (all live)", callback_data=f"sc:mall:{tag}:{offset}"),
     ])
     rows.append([
         InlineKeyboardButton("🏠 Home", callback_data="sc:m:home"),
@@ -695,7 +748,7 @@ def _browse_kb(models, tag, offset, total, step=8):
 
 
 # ---------- record task ----------
-async def _upload_one(client, status_msg, uid, path, model, idx, total):
+async def _upload_one(client, status_msg, uid, path, model, idx, total, quiet=False):
     w, h, dur = probe_video(path)
     thumb = os.path.splitext(path)[0] + "_th.jpg"
     tpath = await make_thumb(path, thumb)
@@ -704,6 +757,8 @@ async def _upload_one(client, status_msg, uid, path, model, idx, total):
     last = [0.0]
 
     async def _prog(cur, tot):
+        if quiet:
+            return
         now = time.time()
         if now - last[0] < 3:
             return
@@ -762,13 +817,55 @@ async def _upload_one(client, status_msg, uid, path, model, idx, total):
 
 
 async def _record_task(client, rec_id, uid, user, model, dur_seconds, quality, status_msg):
+    global _UPLOADING
     rec_meta = _RECS.get(rec_id) or {}
     stop = rec_meta.get("stop") or asyncio.Event()
     work = os.path.join(config.DOWNLOAD_DIR, str(uid), rec_id)
     os.makedirs(work, exist_ok=True)
     reason = "error"
+    uploaded_n = [0]
+    parts = []
+    part_tasks = []
+
+    async def _do_part(path):
+        global _UPLOADING
+        async with _REMUX_LOCK:
+            out = await remux_to_mp4(path)
+        uploaded_n[0] += 1
+        async with _UPLOAD_LOCK:
+            _UPLOADING = model
+            try:
+                await _upload_one(
+                    client, status_msg, uid, out, model, uploaded_n[0], 0, quiet=True,
+                )
+            finally:
+                _UPLOADING = None
+        for fp in (out, path):
+            try:
+                if fp and os.path.exists(fp):
+                    os.remove(fp)
+            except Exception:
+                pass
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
+
+    async def on_part(path):
+        # rec loop block nahi — upload background
+        part_tasks.append(asyncio.create_task(_do_part(path)))
+
+    async def _wait_parts():
+        if part_tasks:
+            await asyncio.gather(*part_tasks, return_exceptions=True)
+            part_tasks.clear()
+
     try:
-        async with aiohttp.ClientSession() as session:
+        conn = aiohttp.TCPConnector(
+            limit=8, ttl_dns_cache=300, enable_cleanup_closed=True, ssl=False,
+        )
+        async with aiohttp.ClientSession(connector=conn) as session:
             model_id = int(rec_meta.get("model_id") or 0)
             if not model_id:
                 st = await fetch_model_status(session, model)
@@ -794,6 +891,7 @@ async def _record_task(client, rec_id, uid, user, model, dur_seconds, quality, s
                 session, model, model_id, quality, dur_seconds, stop, work,
                 until_stop_cap=config.UNTIL_STOP_CAP_MIN * 60,
                 on_tick=on_tick,
+                on_part=on_part,
             )
     except MouflonError as e:
         es = str(e)
@@ -803,10 +901,15 @@ async def _record_task(client, rec_id, uid, user, model, dur_seconds, quality, s
                 await status_msg.delete()
             except Exception:
                 pass
+            await _wait_parts()
             cleanup_dir(work)
             _RECS.pop(rec_id, None)
             _track_del(uid, rec_id)
             monitor.touch_end(uid, model, stt)
+            try:
+                asyncio.create_task(kick_queue(client))
+            except Exception:
+                pass
             return
         try:
             short = "🔒 Group/private — public aate hi naya part."
@@ -819,6 +922,10 @@ async def _record_task(client, rec_id, uid, user, model, dur_seconds, quality, s
         cleanup_dir(work)
         _RECS.pop(rec_id, None)
         _track_del(uid, rec_id)
+        try:
+            asyncio.create_task(kick_queue(client))
+        except Exception:
+            pass
         return
     except Exception as e:
         logger.exception("record crash")
@@ -838,14 +945,19 @@ async def _record_task(client, rec_id, uid, user, model, dur_seconds, quality, s
         _track_del(uid, rec_id)
         if rec_meta.get("monitor"):
             monitor.touch_end(uid, model, "wait")
+        try:
+            asyncio.create_task(kick_queue(client))
+        except Exception:
+            pass
         return
 
+    await _wait_parts()
     label = {
         "stopped": "🛑 stopped", "offline": "📴 public ended",
         "private": "🔒 group/private — next public = naya video",
         "duration": "⏱ done",
     }.get(reason, reason)
-    if not parts:
+    if not parts and not uploaded_n[0]:
         if rec_meta.get("monitor"):
             try:
                 await status_msg.delete()
@@ -855,6 +967,10 @@ async def _record_task(client, rec_id, uid, user, model, dur_seconds, quality, s
             _RECS.pop(rec_id, None)
             _track_del(uid, rec_id)
             monitor.touch_end(uid, model, "private" if reason == "private" else "wait")
+            try:
+                asyncio.create_task(kick_queue(client))
+            except Exception:
+                pass
             return
         try:
             await status_msg.edit_text(f"⚠️ **{model}** — capture nahi ({label}).")
@@ -864,21 +980,55 @@ async def _record_task(client, rec_id, uid, user, model, dur_seconds, quality, s
         cleanup_dir(work)
         _RECS.pop(rec_id, None)
         _track_del(uid, rec_id)
+        try:
+            asyncio.create_task(kick_queue(client))
+        except Exception:
+            pass
+        return
+
+    if not parts and uploaded_n[0]:
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        try:
+            done = await client.send_message(
+                uid, f"✅ **{model}** — {uploaded_n[0]} uploaded ({label}).",
+            )
+            vanish(done, 12)
+        except Exception:
+            pass
+        cleanup_dir(work)
+        _RECS.pop(rec_id, None)
+        _track_del(uid, rec_id)
+        if rec_meta.get("monitor"):
+            monitor.touch_end(uid, model, "wait" if reason != "private" else "private")
+        try:
+            asyncio.create_task(kick_queue(client))
+        except Exception:
+            pass
         return
 
     finals = []
-    for i, p in enumerate(parts, 1):
+    for i, pth in enumerate(parts, 1):
         try:
             await safe_edit(status_msg, neon_stage(model, "REMUX", f"part `{i}/{len(parts)}`"), parse_mode=ParseMode.HTML)
         except Exception:
             pass
-        finals.append(await remux_to_mp4(p))
+        async with _REMUX_LOCK:
+            finals.append(await remux_to_mp4(pth))
 
-    ok = 0
+    ok = uploaded_n[0]
+    total_u = uploaded_n[0] + len(finals)
     for i, path in enumerate(finals, 1):
         try:
-            await safe_edit(status_msg, neon_stage(model, "UPLOAD", f"part `{i}/{len(finals)}`"), parse_mode=ParseMode.HTML)
-            await _upload_one(client, status_msg, uid, path, model, i, len(finals))
+            await safe_edit(status_msg, neon_stage(model, "UPLOAD", f"part `{uploaded_n[0]+i}/{total_u}`"), parse_mode=ParseMode.HTML)
+            async with _UPLOAD_LOCK:
+                _UPLOADING = model
+                try:
+                    await _upload_one(client, status_msg, uid, path, model, uploaded_n[0]+i, total_u)
+                finally:
+                    _UPLOADING = None
             ok += 1
         except Exception as e:
             logger.exception("upload fail")
@@ -893,7 +1043,7 @@ async def _record_task(client, rec_id, uid, user, model, dur_seconds, quality, s
     try:
         done = await client.send_message(
             uid,
-            f"✅ **{model}** — {ok}/{len(finals)} uploaded ({label})."
+            f"✅ **{model}** — {ok} uploaded ({label})."
             if ok else f"❌ **{model}** upload fail ({label}).",
         )
         vanish(done, 12)
@@ -904,20 +1054,79 @@ async def _record_task(client, rec_id, uid, user, model, dur_seconds, quality, s
     _track_del(uid, rec_id)
     if rec_meta.get("monitor"):
         monitor.touch_end(uid, model, "wait" if reason != "private" else "private")
+    try:
+        asyncio.create_task(kick_queue(client))
+    except Exception:
+        pass
+
+
+def rec_capped(uid=None) -> bool:
+    g = int(getattr(config, "MAX_CONCURRENT_REC", 0) or 0)
+    if g and len(_RECS) >= g:
+        return True
+    if uid is not None:
+        u = int(getattr(config, "MAX_REC_PER_USER", 0) or 0)
+        if u and user_rec_count(uid) >= u:
+            return True
+    return False
+
+
+def _q_has(uid, model):
+    m = (model or "").lower()
+    return any(x.get("uid") == uid and (x.get("model") or "").lower() == m for x in _Q)
+
+
+def enqueue_rec(uid, model, dur, quality, from_monitor=False, model_id=0):
+    if _q_has(uid, model) or user_recording_model(uid, model):
+        return False, "already queued/rec"
+    _Q.append({
+        "uid": uid, "model": model, "dur": dur, "quality": quality or "source",
+        "monitor": bool(from_monitor), "model_id": int(model_id or 0),
+    })
+    return True, f"queued `{model}` (#{len(_Q)})"
+
+
+async def kick_queue(client):
+    """Free slot → queue se next rec (only if SC_MAX_REC set)."""
+    try:
+        async with _START_LOCK:
+            if not _Q:
+                return
+            if rec_capped():
+                return
+            nxt = None
+            for i, item in enumerate(list(_Q)):
+                uid = item.get("uid")
+                if rec_capped(uid):
+                    continue
+                if user_recording_model(uid, item.get("model") or ""):
+                    _Q.pop(i)
+                    continue
+                nxt = _Q.pop(i)
+                break
+        if not nxt:
+            return
+        await begin_recording(
+            client, nxt["uid"], nxt["model"], nxt.get("dur") or 0,
+            nxt.get("quality") or "source",
+            from_monitor=bool(nxt.get("monitor")),
+            model_id=int(nxt.get("model_id") or 0),
+        )
+    except Exception:
+        logger.exception("kick_queue")
 
 
 async def begin_recording(client, uid: int, model: str, dur: int, quality: str,
                           from_monitor: bool = False, reply_msg=None, model_id: int = 0):
-    """Start a rec. Returns (ok: bool, err: str)."""
+    """Start a rec. Returns (ok: bool, err: str). Full = queue, crash nahi."""
     async with _START_LOCK:
         if not allowed(uid):
             return False, "Access nahi."
         if user_recording_model(uid, model):
             return False, f"`{model}` pehle se record ho rahi hai."
-        if user_rec_count(uid) >= config.MAX_REC_PER_USER:
-            return False, f"Max {config.MAX_REC_PER_USER} rec ek saath. `/stop` karo."
-        if len(_RECS) >= config.MAX_CONCURRENT_REC:
-            return False, "Server busy — max recordings full."
+        if rec_capped(uid):
+            ok, msg = enqueue_rec(uid, model, dur, quality, from_monitor, model_id)
+            return ok, msg
         rec_id = f"r{uid}_{secrets.token_hex(3)}"
         _RECS[rec_id] = {
             "stop": asyncio.Event(), "user_id": uid, "model": model,
@@ -948,6 +1157,8 @@ async def start_recording(client, c: CallbackQuery, model: str, dur: int, qualit
     ok, err = await begin_recording(client, uid, model, dur, quality, from_monitor=False)
     if not ok:
         return await c.answer(str(err)[:180], show_alert=True)
+    if str(err).startswith("queued"):
+        return await c.answer("⏳ Queue me — next slot pe start", show_alert=True)
     await c.answer("🔴 Recording start!")
 
 
@@ -974,9 +1185,15 @@ async def on_cb(client: Client, c: CallbackQuery):
             await c.answer()
             await panel.edit_html(c, panel.home_text(), panel.home_ikb(uid))
             return
-        if data == "sc:m:mon":
+        if data == "sc:m:mon" or data.startswith("sc:m:mon:"):
+            page = 0
+            if data.startswith("sc:m:mon:"):
+                try:
+                    page = int(data.split(":")[3])
+                except Exception:
+                    page = 0
             await c.answer()
-            await panel.edit_html(c, neon_mon_text(uid), neon_mon_kb(uid))
+            await panel.edit_html(c, neon_mon_text(uid), panel.mon_ikb(uid, page))
             return
         if data == "sc:m:stat":
             await c.answer()
@@ -995,7 +1212,7 @@ async def on_cb(client: Client, c: CallbackQuery):
                  InlineKeyboardButton("🔄", callback_data="sc:m:stat")],
                 [InlineKeyboardButton("⬅️ Home", callback_data="sc:m:home")],
             ])
-            await panel.edit_html(c, "\n".join(lines) + "\n\n" + neon_mon_text(uid), kb)
+            await panel.edit_html(c, dash_text(uid) + "\n\n" + neon_mon_text(uid), kb)
             return
         if data == "sc:m:stop":
             n = 0
@@ -1182,6 +1399,39 @@ async def on_cb(client: Client, c: CallbackQuery):
                     await c.message.edit_text(cap, reply_markup=kb, disable_web_page_preview=True)
                 except Exception:
                     pass
+            return
+        if data.startswith("sc:mall:"):
+            # sc:mall:tag:offset — is page ke models monitor queue me
+            parts = data.split(":")
+            tag = parts[2] if len(parts) > 2 else "girls"
+            offset = int(parts[3]) if len(parts) > 3 else 0
+            await c.answer("📌 adding…")
+            async with aiohttp.ClientSession() as session:
+                models, total = await fetch_online_models(session, tag=tag, limit=8, offset=offset)
+            added = 0
+            started = 0
+            for mdl in models:
+                un = mdl.get("username") or ""
+                if not un:
+                    continue
+                ok, _msg = monitor.add(uid, un, "source")
+                if ok:
+                    added += 1
+                ok2, _e = await begin_recording(
+                    client, uid, un, 0, "source", from_monitor=True,
+                )
+                if ok2:
+                    started += 1
+            await c.answer(
+                f"📌 {added} mon · 🔴 {started} rec start",
+                show_alert=True,
+            )
+            try:
+                await c.message.reply_text(
+                    neon_mon_text(uid), reply_markup=neon_mon_kb(uid), parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
             return
         if data.startswith("sc:pg:"):
             _, _, tag, off = data.split(":", 3)

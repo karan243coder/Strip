@@ -68,7 +68,7 @@ def home_text() -> str:
         "│  Sab <b>buttons</b> se — cmd zaroori nahi\n"
         "│\n"
         "│  📡 Live — online cams tap\n"
-        "│  📌 Monitor — max 2, auto-rec\n"
+        "│  📌 Monitor — 80 watch · rec unlimited (safe)\n"
         "│  🔴 Record — naam / link bhejo\n"
         "│  ⏹ Stop · 📊 Status\n"
         "╰─ online ⇒ rec, gap ~1s ─╯"
@@ -96,21 +96,38 @@ def home_ikb(uid: int = 0):
     return InlineKeyboardMarkup(rows)
 
 
-def mon_ikb(uid: int):
+def mon_ikb(uid: int, page: int = 0):
     from handlers import user_recording_model
+    sl = monitor.slots(uid)
+    per = 8
+    page = max(0, int(page or 0))
+    total = len(sl)
+    pages = max(1, (total + per - 1) // per)
+    if page >= pages:
+        page = pages - 1
+    chunk = sl[page * per:(page + 1) * per]
     rows = []
-    for s in monitor.slots(uid):
+    for s in chunk:
         name = s.get("model") or ""
         rec = "🟢" if user_recording_model(uid, name) else "🔵"
         rows.append([
             InlineKeyboardButton(f"{rec} {name}", callback_data=f"sc:card:{name}"),
             InlineKeyboardButton("🗑", callback_data=f"sc:unmon:{name}"),
         ])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"sc:m:mon:{page-1}"))
+    if total:
+        nav.append(InlineKeyboardButton(f"{page+1}/{pages}", callback_data=f"sc:m:mon:{page}"))
+    if page + 1 < pages:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"sc:m:mon:{page+1}"))
+    if nav:
+        rows.append(nav)
     rows.append([
         InlineKeyboardButton("➕ Add name", callback_data="sc:m:askmon"),
         InlineKeyboardButton("📡 Pick live", callback_data="sc:m:live"),
     ])
-    if monitor.slots(uid):
+    if sl:
         rows.append([InlineKeyboardButton("🗑 Clear all slots", callback_data="sc:unmon:all")])
     rows.append([InlineKeyboardButton("⬅️ Home", callback_data="sc:m:home")])
     return InlineKeyboardMarkup(rows)

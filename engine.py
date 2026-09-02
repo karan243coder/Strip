@@ -17,7 +17,7 @@ from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 import aiohttp
 
-from config import KEY_FILE, PLAYLIST_POLL, MAX_PLAYLIST_FAILS, PART_MAX_BYTES, COOKIE_FILE, STRIPCHAT_COOKIE, ROOT, EDIT_EVERY
+from config import KEY_FILE, PLAYLIST_POLL, MAX_PLAYLIST_FAILS, PART_MAX_BYTES, COOKIE_FILE, STRIPCHAT_COOKIE, ROOT, EDIT_EVERY, FETCH_CONCURRENCY, DISK_MIN_MB
 
 logger = logging.getLogger("sc.engine")
 
@@ -94,7 +94,19 @@ CDN_HOSTS = (
 PRIVATE_STATUSES = frozenset({
     "private", "groupShow", "p2p", "virtualPrivate", "p2pVoice", "offline",
 })
-TAGS = ("girls", "couples", "guys", "trans")
+TAGS = ("girls", "indian", "asian", "latina", "ebony", "arab", "couples", "guys", "trans")
+# cat -> (primaryTag, extra query)
+CAT_QUERY = {
+    "girls": ("girls", ""),
+    "indian": ("girls", "&tag=indian&countries=in"),
+    "asian": ("girls", "&tag=asian"),
+    "latina": ("girls", "&tag=latina"),
+    "ebony": ("girls", "&tag=ebony"),
+    "arab": ("girls", "&tag=arab"),
+    "couples": ("couples", ""),
+    "guys": ("guys", ""),
+    "trans": ("trans", ""),
+}
 LIST_API = "https://stripchat.com/api/front/models"
 CAM_API = "https://stripchat.com/api/front/v2/models/username/{u}/cam"
 
@@ -180,22 +192,54 @@ def _json_object_at(s: str, start: int = 0):
     return None
 
 
+_FETCH_SEM = None
+_FETCH_LOOP = None
+
+
+def _fetch_sem():
+    global _FETCH_SEM, _FETCH_LOOP
+    loop = asyncio.get_running_loop()
+    if _FETCH_SEM is None or _FETCH_LOOP is not loop:
+        _FETCH_SEM = asyncio.Semaphore(max(4, int(FETCH_CONCURRENCY or 16)))
+        _FETCH_LOOP = loop
+    return _FETCH_SEM
+
+
+def disk_free_mb(path: str) -> float:
+    try:
+        st = os.statvfs(path or "/")
+        return (st.f_bavail * st.f_frsize) / (1024 * 1024)
+    except Exception:
+        return 9999.0
+
+
 async def aget(session, url, headers=None, timeout=25, binary=False):
     h = page_headers()
     if headers:
         h.update(headers)
     try:
-        async with session.get(
-            url, headers=h, timeout=aiohttp.ClientTimeout(total=timeout),
-            allow_redirects=True, ssl=False,
-        ) as r:
-            data = await r.read()
-            if binary:
-                return r.status, data
-            return r.status, data.decode("utf-8", "ignore")
-    except Exception as e:
-        logger.debug("GET fail %s: %s", url[:90], e)
-        return 0, None
+        sem = _fetch_sem()
+    except Exception:
+        sem = None
+
+    async def _do():
+        try:
+            async with session.get(
+                url, headers=h, timeout=aiohttp.ClientTimeout(total=timeout),
+                allow_redirects=True, ssl=False,
+            ) as r:
+                data = await r.read()
+                if binary:
+                    return r.status, data
+                return r.status, data.decode("utf-8", "ignore")
+        except Exception as e:
+            logger.debug("GET fail %s: %s", url[:90], e)
+            return 0, None
+
+    if sem is None:
+        return await _do()
+    async with sem:
+        return await _do()
 
 
 def load_key_map() -> dict:
@@ -287,10 +331,13 @@ def add_query(url: str, **params) -> str:
 
 # ---------------- status / browse ----------------
 async def fetch_online_models(session, tag="girls", limit=40, offset=0):
-    if tag not in TAGS:
-        tag = "girls"
-    url = f"{LIST_API}?limit={limit}&offset={offset}&primaryTag={tag}"
+    tag = (tag or "girls").lower()
+    primary, extra = CAT_QUERY.get(tag, ("girls", ""))
+    url = f"{LIST_API}?limit={limit}&offset={offset}&primaryTag={primary}{extra}"
     code, txt = await aget(session, url, headers=HEADERS_JSON)
+    if (code != 200 or not txt) and extra:
+        url = f"{LIST_API}?limit={limit}&offset={offset}&primaryTag={primary}&tag={tag}"
+        code, txt = await aget(session, url, headers=HEADERS_JSON)
     if code != 200 or not txt:
         return [], 0
     try:
@@ -660,10 +707,10 @@ def cleanup_dir(path: str):
 async def record_to_parts(session, model: str, model_id: int, quality: str,
                           dur_seconds: int, stop_event: asyncio.Event,
                           work_dir: str, until_stop_cap: int,
-                          on_tick=None):
+                          on_tick=None, on_part=None):
     """
-    Poll live HLS, append fMP4 fragments. Returns
-    (part_paths: list[str], reason: str, total_bytes: int)
+    Poll live HLS, append fMP4 fragments. on_part(path) optional live-upload.
+    Returns (part_paths leftover, reason, total_bytes, chosen)
     """
     variant_url, psch, pkey, _vars, chosen = await playlist_and_keys(session, model_id, quality)
     vurl = add_query(variant_url, psch=psch, pkey=pkey)
@@ -695,6 +742,7 @@ async def record_to_parts(session, model: str, model_id: int, quality: str,
     init_url_global = [None]
     fails = 0
     last_tick = 0.0
+    flushed = set()
 
     def _open_part():
         nonlocal cur_fh, cur_path, cur_bytes, init_written, part_idx
@@ -729,6 +777,31 @@ async def record_to_parts(session, model: str, model_id: int, quality: str,
             cur_fh.write(data)
             cur_bytes += len(data)
             init_written = True
+
+    async def _flush_closed():
+        if not on_part:
+            return
+        for p in list(parts_written):
+            if p in flushed:
+                continue
+            try:
+                await on_part(p)
+                flushed.add(p)
+            except Exception as e:
+                logger.warning("on_part fail %s: %s", p, e)
+
+    async def _maybe_split():
+        nonlocal cur_bytes
+        need = cur_bytes >= PART_MAX_BYTES
+        if not need and cur_bytes > 8 * 1024 * 1024:
+            if disk_free_mb(work_dir) < float(DISK_MIN_MB or 220):
+                need = True
+        if not need:
+            return
+        _close_part()
+        await _flush_closed()
+        _open_part()
+        await _write_init()
 
     _open_part()
     offline = False
@@ -782,10 +855,7 @@ async def record_to_parts(session, model: str, model_id: int, quality: str,
             for k in ordered:
                 if k in done_keys:
                     continue
-                if cur_bytes >= PART_MAX_BYTES:
-                    _close_part()
-                    _open_part()
-                    await _write_init()
+                await _maybe_split()
                 _, data = await aget(session, segs[k], headers=cdn_headers(), binary=True, timeout=30)
                 if data and len(data) > 100:
                     cur_fh.write(data)
@@ -814,5 +884,13 @@ async def record_to_parts(session, model: str, model_id: int, quality: str,
     finally:
         _close_part()
 
-    reason = "stopped" if stop_event.is_set() else ("offline" if offline else "duration")
-    return parts_written, reason, total_bytes, chosen
+    leftover = [p for p in parts_written if p not in flushed]
+    if stop_event.is_set():
+        reason = "stopped"
+    elif private:
+        reason = "private"
+    elif offline:
+        reason = "offline"
+    else:
+        reason = "duration"
+    return leftover, reason, total_bytes, chosen

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Auto-monitor: max 2 models. Fast HLS ping, no TG flood, crash-proof loop."""
+"""Auto-monitor: many models. Fast HLS ping, no TG flood, crash-proof loop."""
 from __future__ import annotations
 
 import os
@@ -167,7 +167,7 @@ async def _session() -> aiohttp.ClientSession:
         _SESSION = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=8, connect=3, sock_read=6),
             connector=aiohttp.TCPConnector(
-                limit=10, ttl_dns_cache=300, enable_cleanup_closed=True, ssl=False,
+                limit=24, ttl_dns_cache=300, enable_cleanup_closed=True, ssl=False,
             ),
         )
     return _SESSION
@@ -238,7 +238,7 @@ async def _ensure_id(session, slot: dict) -> int:
 
 async def _one(client, session, uid: int, slot: dict) -> None:
     from engine import is_public_live
-    from handlers import begin_recording, user_recording_model, user_rec_count
+    from handlers import begin_recording, user_recording_model
 
     model = slot.get("model") or ""
     if not model:
@@ -249,8 +249,6 @@ async def _one(client, session, uid: int, slot: dict) -> None:
             return
         last_end = float(slot.get("last_end") or 0)
         if last_end and (time.time() - last_end) < config.MONITOR_COOLDOWN:
-            return
-        if user_rec_count(uid) >= config.MAX_REC_PER_USER:
             return
 
         mid = await _ensure_id(session, slot)
@@ -281,13 +279,21 @@ async def _one(client, session, uid: int, slot: dict) -> None:
         logger.exception("monitor one %s", model)
 
 
+_RR = 0
+
+
 async def _tick(client) -> None:
+    global _RR
     watchers = all_watchers()
     if not watchers:
         await _close_session()
         return
+    n = len(watchers)
+    k = min(int(getattr(config, "PING_PER_TICK", 2) or 2), n)
+    batch = [watchers[(_RR + i) % n] for i in range(k)]
+    _RR = (_RR + k) % n
     session = await _session()
     await asyncio.gather(
-        *[_one(client, session, uid, slot) for uid, slot in watchers],
+        *[_one(client, session, uid, slot) for uid, slot in batch],
         return_exceptions=True,
     )
