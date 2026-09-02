@@ -430,24 +430,49 @@ async def fetch_master(session, model_id: int) -> str | None:
 
 
 async def is_hls_live(session, model_id: int, timeout: float = 3.0) -> bool:
-    """Fast online ping — master only, no HTML. Decrypt/CDN path unchanged."""
+    return await is_public_live(session, model_id, timeout=timeout)
+
+
+async def is_public_live(session, model_id: int, timeout: float = 2.2) -> bool:
+    """True only if PUBLIC HLS opens (variant 200 + Mouflon URI). 403/404/group = False."""
     try:
         mid = int(model_id or 0)
     except Exception:
         return False
     if mid <= 0:
         return False
+    master = None
     for host in CDN_HOSTS[:3]:
         url = f"https://edge-hls.{host}/hls/{mid}/master/{mid}_auto.m3u8"
         try:
             code, txt = await aget(session, url, headers=cdn_headers(), timeout=timeout)
         except Exception:
             continue
+        if code in (401, 402, 403):
+            return False
         if code == 200 and isinstance(txt, str) and "#EXT" in txt:
-            if "MOUFLON-ADVERT" in txt and "MOUFLON:URI:" not in txt:
-                return False
-            return True
-    return False
+            master = txt
+            break
+    if not master:
+        return False
+    if "MOUFLON-ADVERT" in master and "MOUFLON:URI:" not in master:
+        return False
+    variants = parse_variants(master)
+    if not variants:
+        return False
+    psch, pkey = extract_psch(master)
+    vurl = variants[0]["url"]
+    if psch and pkey:
+        vurl = add_query(vurl, psch=psch, pkey=pkey)
+    try:
+        code, pl = await aget(session, vurl, headers=cdn_headers(), timeout=timeout)
+    except Exception:
+        return False
+    if code in (401, 402, 403, 404) or code != 200 or not pl:
+        return False
+    if "MOUFLON-ADVERT" in pl and "MOUFLON:URI:" not in pl:
+        return False
+    return "MOUFLON:URI:" in pl or "#EXT-X-MOUFLON:URI:" in pl
 
 
 async def playlist_and_keys(session, model_id: int, quality: str = "source"):
@@ -519,14 +544,11 @@ async def fetch_live_segments(session, variant_url, psch, pkey, pdkey):
     vurl = add_query(variant_url, psch=psch, pkey=pkey)
     code, pl = await aget(session, vurl, headers=cdn_headers(), timeout=15)
     if code == 403:
-        ck = "cookie set" if load_sc_cookie() else "no cookie"
-        raise MouflonError(
-            f"Live playlist 403 ({ck}). Group/ticket/private HLS lock. "
-            "Logged-in Stripchat cookie chahiye (`STRIPCHAT_COOKIE` / cookies.txt) "
-            "jo us show ka access rakhe."
-        )
+        raise MouflonError("PRIVATE")
+    if code == 404:
+        raise MouflonError("OFFLINE")
     if code != 200 or not pl:
-        raise MouflonError(f"live playlist HTTP {code}")
+        raise MouflonError("OFFLINE")
     if "MOUFLON-ADVERT" in pl or ("ENDLIST" in pl and "MOUFLON:URI:" not in pl):
         return None, {}, True
     if "ENDLIST" in pl and "MOUFLON:URI:" in pl:
@@ -647,14 +669,9 @@ async def record_to_parts(session, model: str, model_id: int, quality: str,
     vurl = add_query(variant_url, psch=psch, pkey=pkey)
     code, pl0 = await aget(session, vurl, headers=cdn_headers(), timeout=15)
     if code == 403:
-        ck = "cookie set" if load_sc_cookie() else "no cookie"
-        raise MouflonError(
-            f"Live playlist 403 ({ck}). Group/ticket/private lock. "
-            "Koyeb pe `STRIPCHAT_COOKIE` ya `cookies.txt` daalo (logged-in account "
-            "jiske paas ye show hai)."
-        )
-    if code != 200 or not pl0:
-        raise MouflonError(f"Live playlist nahi khuli (HTTP {code})")
+        raise MouflonError("PRIVATE")
+    if code == 404 or code != 200 or not pl0:
+        raise MouflonError("OFFLINE")
     if "MOUFLON-ADVERT" in pl0 or ("ENDLIST" in pl0 and "MOUFLON:URI:" not in pl0):
         raise MouflonError("Model abhi live nahi hai (sirf advert/preview).")
     uris = [l for l in pl0.splitlines() if l.startswith("#EXT-X-MOUFLON:URI:")]
@@ -715,6 +732,7 @@ async def record_to_parts(session, model: str, model_id: int, quality: str,
 
     _open_part()
     offline = False
+    private = False
     try:
         while time.time() < deadline:
             if stop_event.is_set():
@@ -727,6 +745,18 @@ async def record_to_parts(session, model: str, model_id: int, quality: str,
                     init_url_global[0] = init_url
                 fails = 0
             except MouflonError as e:
+                es = str(e)
+                if es == "PRIVATE" or "403" in es:
+                    private = True
+                    offline = True
+                    break
+                if es == "OFFLINE":
+                    fails += 1
+                    if fails >= 3:
+                        offline = True
+                        break
+                    await asyncio.sleep(PLAYLIST_POLL)
+                    continue
                 fails += 1
                 logger.debug("playlist poll fail (%s) %s", fails, e)
                 if fails >= MAX_PLAYLIST_FAILS:

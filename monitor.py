@@ -119,12 +119,12 @@ def clear(uid: int) -> int:
     return n
 
 
-def touch_end(uid: int, model: str) -> None:
+def touch_end(uid: int, model: str, state: str = "wait") -> None:
     m = _norm(model).lower()
     for s in _MON.get(str(uid), []):
         if (s.get("model") or "").lower() == m:
             s["last_end"] = time.time()
-            s["last_state"] = "wait"
+            s["last_state"] = state or "wait"
             save()
             _reclaim()
             return
@@ -237,7 +237,7 @@ async def _ensure_id(session, slot: dict) -> int:
 
 
 async def _one(client, session, uid: int, slot: dict) -> None:
-    from engine import is_hls_live
+    from engine import is_public_live
     from handlers import begin_recording, user_recording_model, user_rec_count
 
     model = slot.get("model") or ""
@@ -257,37 +257,26 @@ async def _one(client, session, uid: int, slot: dict) -> None:
         if not mid:
             return
         try:
-            online = await is_hls_live(session, mid, timeout=1.6)
+            public = await is_public_live(session, mid, timeout=1.8)
         except Exception as e:
-            logger.debug("hls ping %s: %s", model, e)
+            logger.debug("public ping %s: %s", model, e)
             return
-        if not online:
-            if slot.get("last_state") not in ("wait", None):
+        if not public:
+            prev = slot.get("last_state")
+            if prev not in ("wait", "private", None):
                 slot["last_state"] = "wait"
             return
 
         q = slot.get("quality") or "source"
-        touch_hit(uid, model)
-        logger.info("monitor AUTO-REC uid=%s model=%s id=%s hit=%s",
-                    uid, model, mid, slot.get("hits"))
         ok, err = await begin_recording(
-            client, uid, model, 0, q, from_monitor=True,
+            client, uid, model, 0, q, from_monitor=True, model_id=mid,
         )
         if not ok:
-            logger.info("monitor rec skip %s: %s", model, err)
+            logger.debug("monitor rec skip %s: %s", model, err)
             slot["last_state"] = "wait"
-            now = time.time()
-            if now - float(slot.get("last_fail_tg") or 0) > 180:
-                slot["last_fail_tg"] = now
-                try:
-                    from handlers import safe_send
-                    await safe_send(
-                        client, uid,
-                        f"⚠️ `{model}` online thi, rec skip: {err}",
-                        flood_sleep=False,
-                    )
-                except Exception:
-                    pass
+            return
+        touch_hit(uid, model)
+        logger.info("monitor rec START uid=%s model=%s hit=%s", uid, model, slot.get("hits"))
     except Exception:
         logger.exception("monitor one %s", model)
 

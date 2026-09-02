@@ -77,6 +77,25 @@ async def safe_edit(msg, text, flood_sleep=False, **kw):
         return None
 
 
+def vanish(msg, sec: float = 12):
+    """Bot ke junk replies 12s me udao — rec/video/panel nahi."""
+    if not msg:
+        return msg
+
+    async def _gone():
+        try:
+            await asyncio.sleep(sec)
+            await msg.delete()
+        except Exception:
+            pass
+
+    try:
+        asyncio.create_task(_gone())
+    except Exception:
+        pass
+    return msg
+
+
 def user_rec_count(uid: int) -> int:
     live = {r for r in (_USER_RECS.get(uid) or set()) if r in _RECS}
     if uid in _USER_RECS and live != _USER_RECS.get(uid):
@@ -172,7 +191,10 @@ def neon_mon_text(uid: int) -> str:
         for i, s in enumerate(sl, 1):
             name = s.get("model") or "?"
             stt = s.get("last_state") or "wait"
-            led = {"live": "🟢 REC", "rec": "🟢 REC", "wait": "🔵 WAIT"}.get(stt, "🔵 WAIT")
+            led = {
+                "live": "🟢 REC", "rec": "🟢 REC", "wait": "🔵 WAIT",
+                "private": "🔒 GROUP",
+            }.get(stt, "🔵 WAIT")
             if user_recording_model(uid, name):
                 led = "🟢 REC"
             hits = int(s.get("hits") or 0)
@@ -359,7 +381,8 @@ async def lookup_and_card(client, m: Message, model: str):
             st = await fetch_model_status(session, model)
     except Exception as e:
         try:
-            await wait.edit_text(f"❌ Status fail: `{str(e)[:200]}`")
+            await wait.edit_text("❌ Status fail.")
+            vanish(wait, 12)
         except Exception:
             pass
         return
@@ -398,7 +421,7 @@ async def cmd_rec(client: Client, m: Message):
         arg = m.reply_to_message.text
     model = model_from_input(arg)
     if not model:
-        return await m.reply_text("Usage: `/rec ModelName` ya link paste karo.")
+        return vanish(await m.reply_text("Usage: `/rec ModelName` ya link paste karo."), 12)
     await lookup_and_card(client, m, model)
 
 
@@ -445,7 +468,7 @@ async def cmd_stop(client: Client, m: Message):
         rec["stop"].set()
         stopped += 1
     if not stopped:
-        return await m.reply_text("Koi recording nahi chal rahi.")
+        return vanish(await m.reply_text("Koi recording nahi chal rahi."), 12)
     await m.reply_text(f"🛑 Stop ×{stopped} — neon upload start hoga…")
 
 
@@ -556,7 +579,7 @@ async def handle_menu_action(client: Client, m: Message, action: str):
         except Exception:
             pass
         if not models:
-            return await m.reply_text("❌ live list nahi mili. Link paste karo.")
+            return vanish(await m.reply_text("❌ live list nahi mili. Link paste karo."), 12)
         return await m.reply_text(
             _browse_text(models, "girls", 0, total),
             reply_markup=_browse_kb(models, "girls", 0, total),
@@ -580,7 +603,7 @@ async def handle_menu_action(client: Client, m: Message, action: str):
                 rec["stop"].set()
                 n += 1
         if not n:
-            return await m.reply_text("Koi recording nahi chal rahi.")
+            return vanish(await m.reply_text("Koi recording nahi chal rahi."), 12)
         return await m.reply_text(f"🛑 Stop ×{n} — upload start hoga…")
     if action == "stat":
         return await cmd_stat(client, m)
@@ -613,7 +636,7 @@ async def on_paste(client: Client, m: Message):
             )
         if act == "rec" and model:
             return await lookup_and_card(client, m, model)
-        return await m.reply_text("Naam samajh nahi aaya. Button se phir try karo.")
+        return vanish(await m.reply_text("Naam samajh nahi aaya. Button se phir try karo."), 12)
     text = m.text or ""
     urls = URL_RE.findall(text)
     model = ""
@@ -746,12 +769,14 @@ async def _record_task(client, rec_id, uid, user, model, dur_seconds, quality, s
     reason = "error"
     try:
         async with aiohttp.ClientSession() as session:
-            st = await fetch_model_status(session, model)
-            if not st.get("id"):
-                raise MouflonError("Stream id nahi mila (offline/typo?).")
-            if not st.get("online"):
-                raise MouflonError("Model online nahi dikh rahi.")
-            model_id = int(st["id"])
+            model_id = int(rec_meta.get("model_id") or 0)
+            if not model_id:
+                st = await fetch_model_status(session, model)
+                if not st.get("id"):
+                    raise MouflonError("OFFLINE")
+                if not st.get("online"):
+                    raise MouflonError("OFFLINE")
+                model_id = int(st["id"])
 
             async def on_tick(info):
                 # FloodWait pe sleep NAHI — warna HLS rec ruk jati
@@ -771,40 +796,74 @@ async def _record_task(client, rec_id, uid, user, model, dur_seconds, quality, s
                 on_tick=on_tick,
             )
     except MouflonError as e:
+        es = str(e)
+        stt = "private" if es == "PRIVATE" or "403" in es else "wait"
+        if rec_meta.get("monitor"):
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            cleanup_dir(work)
+            _RECS.pop(rec_id, None)
+            _track_del(uid, rec_id)
+            monitor.touch_end(uid, model, stt)
+            return
         try:
-            await status_msg.edit_text(f"❌ **Recording nahi hui:**\n{e}")
+            short = "🔒 Group/private — public aate hi naya part."
+            if es in ("OFFLINE",) or "404" in es:
+                short = "📴 Public live band."
+            await status_msg.edit_text(short)
+            vanish(status_msg, 12)
         except Exception:
             pass
         cleanup_dir(work)
         _RECS.pop(rec_id, None)
         _track_del(uid, rec_id)
-        if rec_meta.get("monitor"):
-            monitor.touch_end(uid, model)
         return
     except Exception as e:
         logger.exception("record crash")
-        try:
-            await status_msg.edit_text(f"❌ **Error:** `{str(e)[:300]}`")
-        except Exception:
-            pass
+        if rec_meta.get("monitor"):
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        else:
+            try:
+                await status_msg.edit_text("⚠️ Rec error — retry.")
+                vanish(status_msg, 12)
+            except Exception:
+                pass
         cleanup_dir(work)
         _RECS.pop(rec_id, None)
         _track_del(uid, rec_id)
         if rec_meta.get("monitor"):
-            monitor.touch_end(uid, model)
+            monitor.touch_end(uid, model, "wait")
         return
 
-    label = {"stopped": "🛑 stopped", "offline": "📴 stream ended", "duration": "⏱ done"}.get(reason, reason)
+    label = {
+        "stopped": "🛑 stopped", "offline": "📴 public ended",
+        "private": "🔒 group/private — next public = naya video",
+        "duration": "⏱ done",
+    }.get(reason, reason)
     if not parts:
+        if rec_meta.get("monitor"):
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            cleanup_dir(work)
+            _RECS.pop(rec_id, None)
+            _track_del(uid, rec_id)
+            monitor.touch_end(uid, model, "private" if reason == "private" else "wait")
+            return
         try:
-            await status_msg.edit_text(f"⚠️ **{model}** — kuch capture nahi hua ({label}).")
+            await status_msg.edit_text(f"⚠️ **{model}** — capture nahi ({label}).")
+            vanish(status_msg, 12)
         except Exception:
             pass
         cleanup_dir(work)
         _RECS.pop(rec_id, None)
         _track_del(uid, rec_id)
-        if rec_meta.get("monitor"):
-            monitor.touch_end(uid, model)
         return
 
     finals = []
@@ -832,22 +891,23 @@ async def _record_task(client, rec_id, uid, user, model, dur_seconds, quality, s
     except Exception:
         pass
     try:
-        await client.send_message(
+        done = await client.send_message(
             uid,
             f"✅ **{model}** — {ok}/{len(finals)} uploaded ({label})."
             if ok else f"❌ **{model}** upload fail ({label}).",
         )
+        vanish(done, 12)
     except Exception:
         pass
     cleanup_dir(work)
     _RECS.pop(rec_id, None)
     _track_del(uid, rec_id)
     if rec_meta.get("monitor"):
-        monitor.touch_end(uid, model)
+        monitor.touch_end(uid, model, "wait" if reason != "private" else "private")
 
 
 async def begin_recording(client, uid: int, model: str, dur: int, quality: str,
-                          from_monitor: bool = False, reply_msg=None):
+                          from_monitor: bool = False, reply_msg=None, model_id: int = 0):
     """Start a rec. Returns (ok: bool, err: str)."""
     async with _START_LOCK:
         if not allowed(uid):
@@ -862,6 +922,7 @@ async def begin_recording(client, uid: int, model: str, dur: int, quality: str,
         _RECS[rec_id] = {
             "stop": asyncio.Event(), "user_id": uid, "model": model,
             "t0": time.time(), "monitor": bool(from_monitor),
+            "model_id": int(model_id or 0),
         }
         _track_add(uid, rec_id)
     status_msg = await safe_send(
@@ -1150,7 +1211,7 @@ async def on_cb(client: Client, c: CallbackQuery):
 
 
 async def cmd_ping(client: Client, m: Message):
-    await m.reply_text("pong ✅ bot alive")
+    vanish(await m.reply_text("pong ✅ bot alive"), 12)
 
 
 _KNOWN_CMDS = {
@@ -1172,7 +1233,7 @@ async def on_unknown(client: Client, m: Message):
         return
     if not allowed(uid):
         return await m.reply_text(deny_text())
-    return await m.reply_text("Unknown command.\n\n" + HELP, disable_web_page_preview=True)
+    return vanish(await m.reply_text("Unknown command.\n\n" + HELP, disable_web_page_preview=True), 12)
 
 
 def register(app: Client):
