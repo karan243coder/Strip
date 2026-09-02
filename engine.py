@@ -13,7 +13,7 @@ import logging
 import itertools
 import shutil
 import subprocess
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse, quote
 
 import aiohttp
 
@@ -95,17 +95,18 @@ PRIVATE_STATUSES = frozenset({
     "private", "groupShow", "p2p", "virtualPrivate", "p2pVoice", "offline",
 })
 TAGS = ("girls", "indian", "asian", "latina", "ebony", "arab", "couples", "guys", "trans")
-# cat -> (primaryTag, extra query)
+# Stripchat real tag ids (site /girls/indian → ethnicityIndian). tag=indian is IGNORED by API.
+# cat -> (primaryTag, filterGroupTag or None)
 CAT_QUERY = {
-    "girls": ("girls", ""),
-    "indian": ("girls", "&tag=indian&countries=in"),
-    "asian": ("girls", "&tag=asian"),
-    "latina": ("girls", "&tag=latina"),
-    "ebony": ("girls", "&tag=ebony"),
-    "arab": ("girls", "&tag=arab"),
-    "couples": ("couples", ""),
-    "guys": ("guys", ""),
-    "trans": ("trans", ""),
+    "girls": ("girls", None),
+    "indian": ("girls", "ethnicityIndian"),
+    "asian": ("girls", "ethnicityAsian"),
+    "latina": ("girls", "ethnicityLatino"),
+    "ebony": ("girls", "ethnicityEbony"),
+    "arab": ("girls", "ethnicityMiddleEastern"),
+    "couples": ("couples", None),
+    "guys": ("men", None),
+    "trans": ("trans", None),
 }
 LIST_API = "https://stripchat.com/api/front/models"
 CAM_API = "https://stripchat.com/api/front/v2/models/username/{u}/cam"
@@ -331,18 +332,24 @@ def add_query(url: str, **params) -> str:
 
 # ---------------- status / browse ----------------
 async def fetch_online_models(session, tag="girls", limit=40, offset=0):
+    """Real Stripchat lists — Indian ≠ Asian. filterGroupTags, not ignored tag=."""
     tag = (tag or "girls").lower()
-    primary, extra = CAT_QUERY.get(tag, ("girls", ""))
-    url = f"{LIST_API}?limit={limit}&offset={offset}&primaryTag={primary}{extra}"
+    primary, ftag = CAT_QUERY.get(tag, ("girls", None))
+    url = f"{LIST_API}?limit={int(limit)}&offset={int(offset)}&primaryTag={primary}"
+    if ftag:
+        enc = quote(json.dumps([[ftag]], separators=(",", ":")), safe="")
+        url += f"&filterGroupTags={enc}"
     code, txt = await aget(session, url, headers=HEADERS_JSON)
-    if (code != 200 or not txt) and extra:
-        url = f"{LIST_API}?limit={limit}&offset={offset}&primaryTag={primary}&tag={tag}"
-        code, txt = await aget(session, url, headers=HEADERS_JSON)
     if code != 200 or not txt:
         return [], 0
     try:
         d = json.loads(txt)
-        return d.get("models", []) or [], int(d.get("totalCount", 0) or 0)
+        models = d.get("models", []) or []
+        if ftag:
+            total = int(d.get("filteredCount") or d.get("totalCount") or 0)
+        else:
+            total = int(d.get("totalCount") or 0)
+        return models, total
     except Exception:
         return [], 0
 
