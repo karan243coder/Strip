@@ -12,14 +12,19 @@ import secrets
 import aiohttp
 from pyrogram import Client, filters
 from pyrogram.handlers import MessageHandler, CallbackQueryHandler
+from pyrogram.enums import ParseMode
+from pyrogram.errors import FloodWait, MessageNotModified
 from pyrogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
 )
 
 import config
+import monitor
+import panel
 from engine import (
     TAGS, MouflonError, model_from_input, is_stripchat_url,
-    fetch_model_status, fetch_online_models, load_key_map,
+    fetch_model_status, fetch_online_models, load_key_map, load_sc_cookie,
+    fetch_master, parse_variants,
     record_to_parts, remux_to_mp4, probe_video, make_thumb,
     cleanup_dir, humanbytes, fmt_dur,
 )
@@ -28,22 +33,169 @@ logger = logging.getLogger("sc.handlers")
 
 _RECS = {}
 _USER_ACTIVE = {}
+_USER_RECS = {}  # uid -> set(rec_id)
+_START_LOCK = asyncio.Lock()
+
+
+async def safe_send(client, chat_id, text, flood_sleep=True, **kw):
+    """Telegram send — FloodWait pe rec loop block nahi (flood_sleep=False)."""
+    tries = 4 if flood_sleep else 1
+    last = None
+    for i in range(tries):
+        try:
+            return await client.send_message(chat_id, text, **kw)
+        except FloodWait as e:
+            last = e
+            w = int(getattr(e, "value", 5) or 5)
+            logger.warning("FloodWait send %ss", w)
+            if not flood_sleep:
+                return None
+            await asyncio.sleep(min(w, 40) + 1)
+        except Exception as e:
+            last = e
+            logger.debug("safe_send: %s", e)
+            return None
+    return None
+
+
+async def safe_edit(msg, text, flood_sleep=False, **kw):
+    try:
+        return await msg.edit_text(text, **kw)
+    except MessageNotModified:
+        return None
+    except FloodWait as e:
+        w = int(getattr(e, "value", 5) or 5)
+        logger.warning("FloodWait edit %ss (skip, rec continue)", w)
+        if flood_sleep:
+            await asyncio.sleep(min(w, 20) + 1)
+            try:
+                return await msg.edit_text(text, **kw)
+            except Exception:
+                return None
+        return None
+    except Exception:
+        return None
+
+
+def user_rec_count(uid: int) -> int:
+    live = {r for r in (_USER_RECS.get(uid) or set()) if r in _RECS}
+    if uid in _USER_RECS and live != _USER_RECS.get(uid):
+        if live:
+            _USER_RECS[uid] = live
+        else:
+            _USER_RECS.pop(uid, None)
+    return len(live)
+
+
+def user_recording_model(uid: int, model: str) -> bool:
+    m = (model or "").lower()
+    for rid in list(_USER_RECS.get(uid) or []):
+        rec = _RECS.get(rid)
+        if rec and (rec.get("model") or "").lower() == m:
+            return True
+    return False
+
+
+def _track_add(uid: int, rec_id: str):
+    _USER_RECS.setdefault(uid, set()).add(rec_id)
+    _USER_ACTIVE[uid] = rec_id
+
+
+def _track_del(uid: int, rec_id: str):
+    s = _USER_RECS.get(uid)
+    if s:
+        s.discard(rec_id)
+        if not s:
+            _USER_RECS.pop(uid, None)
+    if _USER_ACTIVE.get(uid) == rec_id:
+        left = _USER_RECS.get(uid)
+        if left:
+            _USER_ACTIVE[uid] = next(iter(left))
+        else:
+            _USER_ACTIVE.pop(uid, None)
+
+
+def _neon_bar(pct: float, width: int = 14) -> str:
+    pct = max(0.0, min(100.0, float(pct)))
+    fill = int(round(pct / 100.0 * width))
+    return "▓" * fill + "░" * (width - fill)
+
+
+def neon_rec_text(model: str, info: dict, rec_id: str = "") -> str:
+    el = int(info.get("elapsed") or 0)
+    left = info.get("left")
+    bts = int(info.get("bytes") or 0)
+    parts = info.get("parts") or 1
+    q = info.get("quality") or "?"
+    res = info.get("res") or ""
+    spd = int(bts / max(el, 1))
+    if left is not None and left >= 0:
+        total = el + int(left)
+        pct = (el / max(total, 1)) * 100
+        bar = _neon_bar(pct)
+        eta = f"⏳ `{fmt_dur(int(left))}`"
+        pct_s = f"{pct:5.1f}%"
+    else:
+        pulse = int((el // 2) % 14)
+        bar = "░" * pulse + "▓" + "░" * (13 - pulse)
+        eta = "♾ until offline"
+        pct_s = "LIVE"
+    res_bit = f" · `{res}`" if res else ""
+    return (
+        "╭─ ⟨ <b>ＮＥＯＮ ＲＥＣ</b> ⟩ ─╮\n"
+        f"│ 🔴 <b>{model}</b>\n"
+        f"│ <code>{bar}</code>  <b>{pct_s}</b>\n"
+        f"│ ⏱ `{fmt_dur(el)}`  {eta}\n"
+        f"│ 💾 `{humanbytes(bts)}`  📶 `{humanbytes(spd)}/s`\n"
+        f"│ 🎞 `{q}`{res_bit}  🧩 `{parts}`\n"
+        "╰─ ⏹ stop = upload ─╯"
+    )
+
+
+def neon_stage(model: str, title: str, line: str = "") -> str:
+    return (
+        "╭─ ⟨ <b>ＮＥＯＮ</b> ⟩ ─╮\n"
+        f"│ 💠 <b>{title}</b>\n"
+        f"│ 🎬 `{model}`\n"
+        + (f"│ {line}\n" if line else "")
+        + "╰───────────────╯"
+    )
+
+
+def neon_mon_text(uid: int) -> str:
+    sl = monitor.slots(uid)
+    lines = ["╭─ ⟨ <b>ＡＵＴＯ ＭＯＮ</b> ⟩ ─╮"]
+    if not sl:
+        lines.append("│  empty — ➕ Add ya 📡 Live")
+        lines.append(f"│  slots `0/{config.MAX_MONITORS}`")
+    else:
+        for i, s in enumerate(sl, 1):
+            name = s.get("model") or "?"
+            stt = s.get("last_state") or "wait"
+            led = {"live": "🟢 REC", "rec": "🟢 REC", "wait": "🔵 WAIT"}.get(stt, "🔵 WAIT")
+            if user_recording_model(uid, name):
+                led = "🟢 REC"
+            hits = int(s.get("hits") or 0)
+            q = s.get("quality") or "source"
+            lines.append(f"│ <b>SLOT {i}</b>  {led}")
+            lines.append(f"│  `{name}` · `{q}` · hits `{hits}`")
+    lines.append("╰─ online ⇒ auto rec ─╯")
+    lines.append(f"max <b>{config.MAX_MONITORS}</b> · poll <code>{int(config.MONITOR_POLL)}s</code>")
+    return "\n".join(lines)
+
+
+def neon_mon_kb(uid: int):
+    return panel.mon_ikb(uid)
+
 
 HELP = (
     "🔴 **Stripchat Live Recorder**\n"
-    "Sirf Stripchat + white-label live cams.\n\n"
-    "**Kaise use karein**\n"
-    "• Link paste karo\n"
-    "  `https://stripchat.com/Model`\n"
-    "  `https://superchatlive.com/Model`\n"
-    "  `https://xhamsterlive.com/Model`\n"
-    "• `/rec ModelName`\n"
-    "• `/live` ya `/top` — online browse\n"
-    "• `/stop` — apni recording band\n"
-    "• `/mystat` — running rec\n\n"
-    "Public LIVE pe record hota hai. Private / group-show = 403, skip.\n"
-    "Duration: 1 / 5 / 10 / 30 min ya Until Stop."
+    "Neeche **buttons** se chalao — cmd zaroori nahi.\n\n"
+    "📡 Live · 📌 Monitor (max 2) · 🔴 Record\n"
+    "⏹ Stop · 📊 Status · 🔐 Admin (owner)\n\n"
+    "Link paste bhi chalega. Public + group/ticket try."
 )
+
 
 
 def allowed(uid: int) -> bool:
@@ -97,48 +249,95 @@ def _card_caption(st: dict) -> str:
         badges.append("HD")
     if st.get("vr"):
         badges.append("VR")
-    badges.append("PRIVATE 🔒" if st.get("private") else "PUBLIC")
-    if st.get("status"):
-        badges.append(str(st["status"]))
+    stt = str(st.get("status") or "")
+    if st.get("private") or stt in ("groupShow", "ticketShow", "private", "p2p", "virtualPrivate"):
+        badges.append({"groupShow": "GROUP", "ticketShow": "TICKET", "private": "PRIVATE",
+                       "p2p": "P2P", "virtualPrivate": "VIP"}.get(stt, "LOCKED"))
+    else:
+        badges.append("PUBLIC")
+    if stt and stt not in badges:
+        badges.append(stt)
+    warn = ""
+    if st.get("private") or stt in ("groupShow", "ticketShow", "private", "p2p", "virtualPrivate"):
+        warn = ("⚠️ Group/ticket/private — bina logged-in cookie ke CDN 403 de sakta hai.\n"
+                "Record try allowed. Cookie: `STRIPCHAT_COOKIE` / cookies.txt\n")
+    else:
+        warn = "Duration choose karo, phir quality:"
     return (
         f"🔴 **{u}**\n\n"
         f"{'📡 **LIVE**' if st.get('online') else '📵'}"
         f" | 👀 `{st.get('viewers', 0)}` | 🌍 `{st.get('country') or '??'}`\n"
         f"🏷 `{' | '.join(badges)}` | id `{st.get('id') or '?'}`\n\n"
-        + ("⚠️ Private/group show — public HLS nahi, record nahi hoga.\n"
-           if st.get("private") else "Quality + duration choose karo:")
+        + warn
     )
 
 
 def _card_kb(st: dict):
     u = st["username"]
     rows = []
-    if st.get("online") and not st.get("private"):
+    if st.get("online"):
         rows.append([
-            InlineKeyboardButton("1 min", callback_data=f"sc:q:{u}:60"),
-            InlineKeyboardButton("5 min", callback_data=f"sc:q:{u}:300"),
-            InlineKeyboardButton("10 min", callback_data=f"sc:q:{u}:600"),
+            InlineKeyboardButton("1m", callback_data=f"sc:q:{u}:60"),
+            InlineKeyboardButton("2m", callback_data=f"sc:q:{u}:120"),
+            InlineKeyboardButton("5m", callback_data=f"sc:q:{u}:300"),
+            InlineKeyboardButton("10m", callback_data=f"sc:q:{u}:600"),
         ])
         rows.append([
-            InlineKeyboardButton("30 min", callback_data=f"sc:q:{u}:1800"),
-            InlineKeyboardButton("♾ Until Stop", callback_data=f"sc:q:{u}:0"),
+            InlineKeyboardButton("15m", callback_data=f"sc:q:{u}:900"),
+            InlineKeyboardButton("30m", callback_data=f"sc:q:{u}:1800"),
+            InlineKeyboardButton("♾ Stop", callback_data=f"sc:q:{u}:0"),
         ])
     rows.append([
+        InlineKeyboardButton("📌 Auto Monitor", callback_data=f"sc:mon:{u}"),
         InlineKeyboardButton("🔄 Refresh", callback_data=f"sc:card:{u}"),
+    ])
+    rows.append([
+        InlineKeyboardButton("🏠 Home", callback_data="sc:m:home"),
         InlineKeyboardButton("✖️ Close", callback_data="sc:close"),
     ])
     return InlineKeyboardMarkup(rows)
 
 
-def _qual_kb(model: str, dur: int):
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("Source", callback_data=f"sc:rec:{model}:{dur}:source"),
-            InlineKeyboardButton("480p", callback_data=f"sc:rec:{model}:{dur}:480p"),
-            InlineKeyboardButton("240p", callback_data=f"sc:rec:{model}:{dur}:240p"),
-        ],
-        [InlineKeyboardButton("⬅️ Back", callback_data=f"sc:card:{model}")],
-    ])
+_QUAL_FALLBACK = [
+    ("Best", "source"), ("720p", "720p"), ("480p", "480p"),
+    ("360p", "360p"), ("240p", "240p"), ("160p", "160p"),
+]
+
+
+def _qual_kb(model: str, dur: int, variants=None):
+    rows = []
+    used = set()
+    btns = []
+    if variants:
+        for v in variants:
+            name = (v.get("name") or "source").strip()
+            res = v.get("res") or ""
+            key = name.lower().replace(" ", "")
+            if key in used:
+                continue
+            used.add(key)
+            label = "Best" if key in ("source", "orig") else name
+            if res:
+                label = f"{label} {res.split('x')[0]}p" if "x" in res else f"{label} {res}"
+            btns.append((label[:18], key[:16] or "source"))
+    if not btns:
+        btns = list(_QUAL_FALLBACK)
+    else:
+        # ensure extra common rungs if playlist skipped some names
+        have = {k for _l, k in btns}
+        for lab, key in _QUAL_FALLBACK:
+            if key not in have and key != "source":
+                btns.append((lab, key))
+    row = []
+    for lab, key in btns[:8]:
+        row.append(InlineKeyboardButton(lab, callback_data=f"sc:rec:{model}:{dur}:{key}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data=f"sc:card:{model}")])
+    return InlineKeyboardMarkup(rows)
 
 
 async def send_card(client: Client, m: Message, st: dict):
@@ -176,9 +375,17 @@ async def cmd_start(client: Client, m: Message):
     uid = m.from_user.id if m.from_user else 0
     if not allowed(uid):
         return await m.reply_text(deny_text())
-    km = load_key_map()
-    extra = f"\n🔑 Keys loaded: **{len(km)}** pair(s)" if is_owner(uid) else ""
-    await m.reply_text(HELP + extra, disable_web_page_preview=True)
+    await m.reply_text(
+        panel.home_text(),
+        reply_markup=panel.reply_kb(uid),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+    await m.reply_text(
+        "🎛️ <b>Panel</b> — tap a button",
+        reply_markup=panel.home_ikb(uid),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def cmd_rec(client: Client, m: Message):
@@ -221,24 +428,103 @@ async def cmd_live(client: Client, m: Message):
 
 async def cmd_stop(client: Client, m: Message):
     uid = m.from_user.id if m.from_user else 0
-    rec_id = _USER_ACTIVE.get(uid)
-    rec = _RECS.get(rec_id) if rec_id else None
-    if not rec:
+    parts = (m.text or "").split(None, 1)
+    want = model_from_input(parts[1]) if len(parts) > 1 else ""
+    ids = list(_USER_RECS.get(uid) or [])
+    if not ids:
+        rid = _USER_ACTIVE.get(uid)
+        if rid:
+            ids = [rid]
+    stopped = 0
+    for rec_id in ids:
+        rec = _RECS.get(rec_id)
+        if not rec:
+            continue
+        if want and (rec.get("model") or "").lower() != want.lower():
+            continue
+        rec["stop"].set()
+        stopped += 1
+    if not stopped:
         return await m.reply_text("Koi recording nahi chal rahi.")
-    rec["stop"].set()
-    await m.reply_text("🛑 Stop — finalize + upload ho raha hai…")
+    await m.reply_text(f"🛑 Stop ×{stopped} — neon upload start hoga…")
 
 
 async def cmd_stat(client: Client, m: Message):
     uid = m.from_user.id if m.from_user else 0
-    rec_id = _USER_ACTIVE.get(uid)
-    rec = _RECS.get(rec_id) if rec_id else None
-    if not rec:
-        return await m.reply_text("Idle — koi rec nahi.")
-    el = int(time.time() - rec.get("t0", time.time()))
+    ids = [r for r in (_USER_RECS.get(uid) or []) if r in _RECS]
+    if not ids:
+        rid = _USER_ACTIVE.get(uid)
+        if rid and rid in _RECS:
+            ids = [rid]
+    if not ids:
+        return await m.reply_text(neon_mon_text(uid), reply_markup=neon_mon_kb(uid), parse_mode=ParseMode.HTML)
+    lines = ["╭─ ⟨ <b>ＮＥＯＮ ＳＴＡＴ</b> ⟩ ─╮"]
+    for rec_id in ids:
+        rec = _RECS[rec_id]
+        el = int(time.time() - rec.get("t0", time.time()))
+        tag = "📌 mon" if rec.get("monitor") else "🎙 rec"
+        lines.append(f"│ {tag} <b>{rec.get('model')}</b>  ⏱ `{fmt_dur(el)}`")
+    lines.append("╰───────────────╯")
+    await m.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+
+async def cmd_mon(client: Client, m: Message):
+    uid = m.from_user.id if m.from_user else 0
+    if not allowed(uid):
+        return await m.reply_text(deny_text())
+    parts = (m.text or "").split()
+    arg = " ".join(parts[1:]) if len(parts) > 1 else ""
+    if not arg:
+        return await m.reply_text(neon_mon_text(uid), reply_markup=neon_mon_kb(uid))
+    bits = arg.split()
+    model = model_from_input(bits[0])
+    quality = "source"
+    if len(bits) > 1:
+        q = bits[1].lower().replace(" ", "")
+        if q in ("source", "best", "720p", "720", "480p", "480", "360p", "240p", "160p"):
+            quality = {"best": "source", "720": "720p", "480": "480p"}.get(q, q)
+    if not model:
+        return await m.reply_text("Usage: `/mon ModelName`  (optional quality: `/mon Model 720p`)")
+    ok, msg = monitor.add(uid, model, quality)
     await m.reply_text(
-        f"🔴 **{rec.get('model')}** recording\n"
-        f"⏱ `{fmt_dur(el)}` | id `{rec_id}`"
+        (msg + "\n\n" if ok else "⚠️ " + msg + "\n\n") + neon_mon_text(uid),
+        reply_markup=neon_mon_kb(uid),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_unmon(client: Client, m: Message):
+    uid = m.from_user.id if m.from_user else 0
+    if not allowed(uid):
+        return await m.reply_text(deny_text())
+    parts = (m.text or "").split(None, 1)
+    arg = (parts[1] if len(parts) > 1 else "").strip()
+    if not arg:
+        return await m.reply_text("Usage: `/unmon Model` ya `/unmon all`")
+    if arg.lower() in ("all", "*", "clear"):
+        n = monitor.clear(uid)
+        return await m.reply_text(f"🗑 {n} slot(s) clear.\n\n" + neon_mon_text(uid),
+                                  reply_markup=neon_mon_kb(uid))
+    model = model_from_input(arg) or arg
+    if monitor.remove(uid, model):
+        await m.reply_text(f"🗑 `{model}` hata diya.\n\n" + neon_mon_text(uid),
+                           reply_markup=neon_mon_kb(uid))
+    else:
+        await m.reply_text(f"`{model}` monitor pe nahi thi.")
+
+
+async def cmd_admin(client: Client, m: Message):
+    uid = m.from_user.id if m.from_user else 0
+    if not allowed(uid):
+        return await m.reply_text(deny_text())
+    first = ((m.text or "").split() or [""])[0].lstrip("/").split("@")[0].lower()
+    if first == "menu":
+        return await cmd_start(client, m)
+    if not is_owner(uid):
+        return await cmd_start(client, m)
+    await m.reply_text(
+        panel.admin_text(), reply_markup=panel.admin_ikb(), parse_mode=ParseMode.HTML,
     )
 
 
@@ -257,10 +543,77 @@ async def cmd_keys(client: Client, m: Message):
 URL_RE = re.compile(r"https?://[^\s<>]+", re.I)
 
 
+async def handle_menu_action(client: Client, m: Message, action: str):
+    uid = m.from_user.id if m.from_user else 0
+    if action == "home":
+        return await cmd_start(client, m)
+    if action == "live":
+        wait = await m.reply_text("🔍 Online **girls**…")
+        async with aiohttp.ClientSession() as session:
+            models, total = await fetch_online_models(session, tag="girls", limit=8, offset=0)
+        try:
+            await wait.delete()
+        except Exception:
+            pass
+        if not models:
+            return await m.reply_text("❌ live list nahi mili. Link paste karo.")
+        return await m.reply_text(
+            _browse_text(models, "girls", 0, total),
+            reply_markup=_browse_kb(models, "girls", 0, total),
+            disable_web_page_preview=True,
+        )
+    if action == "mon":
+        return await m.reply_text(
+            neon_mon_text(uid), reply_markup=neon_mon_kb(uid), parse_mode=ParseMode.HTML,
+        )
+    if action == "rec":
+        panel.set_wait(uid, "rec")
+        return await m.reply_text(
+            "🔴 <b>Record</b> — model naam ya Stripchat link bhejo.\n⏱ 3 min",
+            parse_mode=ParseMode.HTML,
+        )
+    if action == "stop":
+        n = 0
+        for rec_id in list(_USER_RECS.get(uid) or []):
+            rec = _RECS.get(rec_id)
+            if rec:
+                rec["stop"].set()
+                n += 1
+        if not n:
+            return await m.reply_text("Koi recording nahi chal rahi.")
+        return await m.reply_text(f"🛑 Stop ×{n} — upload start hoga…")
+    if action == "stat":
+        return await cmd_stat(client, m)
+    if action == "admin":
+        if not is_owner(uid):
+            return await m.reply_text("Owner only.")
+        return await m.reply_text(
+            panel.admin_text(), reply_markup=panel.admin_ikb(), parse_mode=ParseMode.HTML,
+        )
+
+
 async def on_paste(client: Client, m: Message):
     uid = m.from_user.id if m.from_user else 0
     if not allowed(uid):
         return await m.reply_text(deny_text())
+    text = (m.text or "").strip()
+    if text in panel.KB_MAP:
+        return await handle_menu_action(client, m, panel.KB_MAP[text])
+    w = panel.pop_wait(uid)
+    if w:
+        act = w.get("a")
+        model = model_from_input(text)
+        if not model and act in ("mon", "rec"):
+            model = model_from_input(text.split()[0]) if text.split() else ""
+        if act in ("mon", "amon") and model:
+            ok, msg = monitor.add(uid, model, "source")
+            return await m.reply_text(
+                (msg + "\n\n" if ok else "⚠️ " + msg + "\n\n") + neon_mon_text(uid),
+                reply_markup=neon_mon_kb(uid), parse_mode=ParseMode.HTML,
+            )
+        if act == "rec" and model:
+            return await lookup_and_card(client, m, model)
+        return await m.reply_text("Naam samajh nahi aaya. Button se phir try karo.")
     text = m.text or ""
     urls = URL_RE.findall(text)
     model = ""
@@ -291,10 +644,14 @@ def _browse_text(models, tag, offset, total):
 def _browse_kb(models, tag, offset, total, step=8):
     rows = []
     for mdl in models:
-        rows.append([InlineKeyboardButton(
-            f"🔴 {mdl.get('username')} ({mdl.get('viewersCount', 0)})",
-            callback_data=f"sc:card:{mdl.get('username')}",
-        )])
+        un = mdl.get("username") or ""
+        rows.append([
+            InlineKeyboardButton(
+                f"🔴 {un} ({mdl.get('viewersCount', 0)})",
+                callback_data=f"sc:card:{un}",
+            ),
+            InlineKeyboardButton("📌", callback_data=f"sc:mon:{un}"),
+        ])
     nav = []
     if offset > 0:
         nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"sc:pg:{tag}:{max(0, offset-step)}"))
@@ -307,7 +664,10 @@ def _browse_kb(models, tag, offset, total, step=8):
                              callback_data=f"sc:pg:{t}:0")
         for t in TAGS
     ])
-    rows.append([InlineKeyboardButton("✖️ Close", callback_data="sc:close")])
+    rows.append([
+        InlineKeyboardButton("🏠 Home", callback_data="sc:m:home"),
+        InlineKeyboardButton("✖️ Close", callback_data="sc:close"),
+    ])
     return InlineKeyboardMarkup(rows)
 
 
@@ -327,10 +687,16 @@ async def _upload_one(client, status_msg, uid, path, model, idx, total):
         last[0] = now
         el = max(now - started, 0.001)
         try:
-            await status_msg.edit_text(
-                f"📤 **Uploading…** `{humanbytes(cur)}/{humanbytes(tot)}` "
-                f"({humanbytes(int(cur / el))}/s)\n🎬 {title}"
-                + (f" [Part {idx}/{total}]" if total > 1 else "")
+            await safe_edit(
+                status_msg,
+                neon_stage(
+                    title.split()[0] if title else "upload",
+                    "UPLOAD",
+                    f"`{humanbytes(cur)}/{humanbytes(tot)}`  📶 `{humanbytes(int(cur / el))}/s`"
+                    + (f"  part `{idx}/{total}`" if total > 1 else ""),
+                ),
+                flood_sleep=False,
+                parse_mode=ParseMode.HTML,
             )
         except Exception:
             pass
@@ -338,13 +704,24 @@ async def _upload_one(client, status_msg, uid, path, model, idx, total):
     cap = f"🎥 **{title}**\n🔴 Stripchat LIVE"
     if total > 1:
         cap += f" | Part {idx}/{total}"
-    await client.send_video(
-        chat_id=uid, video=path, caption=cap,
-        duration=max(dur, 1), width=w or 0, height=h or 0,
-        supports_streaming=True,
-        thumb=tpath if tpath else None,
-        progress=_prog,
-    )
+    for _try in range(5):
+        try:
+            await client.send_video(
+                chat_id=uid, video=path, caption=cap,
+                duration=max(dur, 1), width=w or 0, height=h or 0,
+                supports_streaming=True,
+                thumb=tpath if tpath else None,
+                progress=_prog,
+            )
+            break
+        except FloodWait as e:
+            wsec = min(int(getattr(e, "value", 8) or 8), 60)
+            logger.warning("FloodWait upload %ss", wsec)
+            await asyncio.sleep(wsec + 1)
+        except Exception:
+            if _try == 4:
+                raise
+            await asyncio.sleep(2)
     if config.LOG_CHANNEL:
         try:
             await client.send_video(
@@ -362,7 +739,8 @@ async def _upload_one(client, status_msg, uid, path, model, idx, total):
 
 
 async def _record_task(client, rec_id, uid, user, model, dur_seconds, quality, status_msg):
-    stop = _RECS[rec_id]["stop"]
+    rec_meta = _RECS.get(rec_id) or {}
+    stop = rec_meta.get("stop") or asyncio.Event()
     work = os.path.join(config.DOWNLOAD_DIR, str(uid), rec_id)
     os.makedirs(work, exist_ok=True)
     reason = "error"
@@ -371,24 +749,17 @@ async def _record_task(client, rec_id, uid, user, model, dur_seconds, quality, s
             st = await fetch_model_status(session, model)
             if not st.get("id"):
                 raise MouflonError("Stream id nahi mila (offline/typo?).")
-            if st.get("private"):
-                raise MouflonError("Private/group show — public stream nahi hai.")
             if not st.get("online"):
                 raise MouflonError("Model online nahi dikh rahi.")
             model_id = int(st["id"])
 
             async def on_tick(info):
-                left = info.get("left")
-                q = info.get("quality") or quality
-                res = info.get("res") or ""
-                await status_msg.edit_text(
-                    f"🔴 **RECORDING: {model}**\n\n"
-                    f"🎞 `{q}` {('('+res+')') if res else ''}\n"
-                    f"⏱ Elapsed: `{fmt_dur(info['elapsed'])}`"
-                    + (f" | ⏳ Left: `{fmt_dur(left)}`\n" if left is not None else " | ♾ Until Stop\n")
-                    + f"💾 `{humanbytes(info['bytes'])}` | 🧩 parts `{info['parts']}`\n"
-                    f"📶 `{humanbytes(int(info['bytes']/max(info['elapsed'],1)))}/s`\n\n"
-                    f"⏹ Stop dabao:",
+                # FloodWait pe sleep NAHI — warna HLS rec ruk jati
+                await safe_edit(
+                    status_msg,
+                    neon_rec_text(model, info, rec_id),
+                    flood_sleep=False,
+                    parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup(
                         [[InlineKeyboardButton("⏹ STOP & UPLOAD", callback_data=f"sc:stop:{rec_id}")]]
                     ),
@@ -406,7 +777,9 @@ async def _record_task(client, rec_id, uid, user, model, dur_seconds, quality, s
             pass
         cleanup_dir(work)
         _RECS.pop(rec_id, None)
-        _USER_ACTIVE.pop(uid, None)
+        _track_del(uid, rec_id)
+        if rec_meta.get("monitor"):
+            monitor.touch_end(uid, model)
         return
     except Exception as e:
         logger.exception("record crash")
@@ -416,7 +789,9 @@ async def _record_task(client, rec_id, uid, user, model, dur_seconds, quality, s
             pass
         cleanup_dir(work)
         _RECS.pop(rec_id, None)
-        _USER_ACTIVE.pop(uid, None)
+        _track_del(uid, rec_id)
+        if rec_meta.get("monitor"):
+            monitor.touch_end(uid, model)
         return
 
     label = {"stopped": "🛑 stopped", "offline": "📴 stream ended", "duration": "⏱ done"}.get(reason, reason)
@@ -427,13 +802,15 @@ async def _record_task(client, rec_id, uid, user, model, dur_seconds, quality, s
             pass
         cleanup_dir(work)
         _RECS.pop(rec_id, None)
-        _USER_ACTIVE.pop(uid, None)
+        _track_del(uid, rec_id)
+        if rec_meta.get("monitor"):
+            monitor.touch_end(uid, model)
         return
 
     finals = []
     for i, p in enumerate(parts, 1):
         try:
-            await status_msg.edit_text(f"🎞 **Remux…** {i}/{len(parts)}")
+            await safe_edit(status_msg, neon_stage(model, "REMUX", f"part `{i}/{len(parts)}`"), parse_mode=ParseMode.HTML)
         except Exception:
             pass
         finals.append(await remux_to_mp4(p))
@@ -441,7 +818,7 @@ async def _record_task(client, rec_id, uid, user, model, dur_seconds, quality, s
     ok = 0
     for i, path in enumerate(finals, 1):
         try:
-            await status_msg.edit_text(f"📤 **Uploading…** {i}/{len(finals)}")
+            await safe_edit(status_msg, neon_stage(model, "UPLOAD", f"part `{i}/{len(finals)}`"), parse_mode=ParseMode.HTML)
             await _upload_one(client, status_msg, uid, path, model, i, len(finals))
             ok += 1
         except Exception as e:
@@ -464,22 +841,52 @@ async def _record_task(client, rec_id, uid, user, model, dur_seconds, quality, s
         pass
     cleanup_dir(work)
     _RECS.pop(rec_id, None)
-    _USER_ACTIVE.pop(uid, None)
+    _track_del(uid, rec_id)
+    if rec_meta.get("monitor"):
+        monitor.touch_end(uid, model)
+
+
+async def begin_recording(client, uid: int, model: str, dur: int, quality: str,
+                          from_monitor: bool = False, reply_msg=None):
+    """Start a rec. Returns (ok: bool, err: str)."""
+    async with _START_LOCK:
+        if not allowed(uid):
+            return False, "Access nahi."
+        if user_recording_model(uid, model):
+            return False, f"`{model}` pehle se record ho rahi hai."
+        if user_rec_count(uid) >= config.MAX_REC_PER_USER:
+            return False, f"Max {config.MAX_REC_PER_USER} rec ek saath. `/stop` karo."
+        if len(_RECS) >= config.MAX_CONCURRENT_REC:
+            return False, "Server busy — max recordings full."
+        rec_id = f"r{uid}_{secrets.token_hex(3)}"
+        _RECS[rec_id] = {
+            "stop": asyncio.Event(), "user_id": uid, "model": model,
+            "t0": time.time(), "monitor": bool(from_monitor),
+        }
+        _track_add(uid, rec_id)
+    status_msg = await safe_send(
+        client, uid, neon_stage(model, "BOOT", f"`{quality}` · starting…"),
+        flood_sleep=True,
+        parse_mode=ParseMode.HTML,
+    )
+    if status_msg is None:
+        try:
+            status_msg = await client.send_message(
+                uid, f"🔴 REC `{model}` starting…",
+            )
+        except Exception as e:
+            _RECS.pop(rec_id, None)
+            _track_del(uid, rec_id)
+            return False, f"telegram send fail: {e}"
+    asyncio.create_task(_record_task(client, rec_id, uid, None, model, dur, quality, status_msg))
+    return True, rec_id
 
 
 async def start_recording(client, c: CallbackQuery, model: str, dur: int, quality: str):
     uid = c.from_user.id
-    if not allowed(uid):
-        return await c.answer("Access nahi.", show_alert=True)
-    if uid in _USER_ACTIVE:
-        return await c.answer("Pehle current rec Stop karo.", show_alert=True)
-    if len(_RECS) >= config.MAX_CONCURRENT_REC:
-        return await c.answer("Server busy — max recordings full.", show_alert=True)
-    status_msg = await c.message.reply_text(f"⏳ **{model}** start ho rahi hai… (`{quality}`)")
-    rec_id = f"r{uid}_{secrets.token_hex(3)}"
-    _RECS[rec_id] = {"stop": asyncio.Event(), "user_id": uid, "model": model, "t0": time.time()}
-    _USER_ACTIVE[uid] = rec_id
-    asyncio.create_task(_record_task(client, rec_id, uid, c.from_user, model, dur, quality, status_msg))
+    ok, err = await begin_recording(client, uid, model, dur, quality, from_monitor=False)
+    if not ok:
+        return await c.answer(str(err)[:180], show_alert=True)
     await c.answer("🔴 Recording start!")
 
 
@@ -502,6 +909,154 @@ async def on_cb(client: Client, c: CallbackQuery):
             return await c.answer("Recording active nahi.", show_alert=True)
         if not allowed(uid):
             return await c.answer("Access nahi.", show_alert=True)
+        if data == "sc:m:home":
+            await c.answer()
+            await panel.edit_html(c, panel.home_text(), panel.home_ikb(uid))
+            return
+        if data == "sc:m:mon":
+            await c.answer()
+            await panel.edit_html(c, neon_mon_text(uid), neon_mon_kb(uid))
+            return
+        if data == "sc:m:stat":
+            await c.answer()
+            ids = [r for r in (_USER_RECS.get(uid) or []) if r in _RECS]
+            lines = ["╭─ ⟨ <b>ＳＴＡＴ</b> ⟩ ─╮"]
+            if not ids:
+                lines.append("│  rec idle")
+            for rec_id in ids:
+                rec = _RECS[rec_id]
+                el = int(time.time() - rec.get("t0", time.time()))
+                tag = "📌" if rec.get("monitor") else "🎙"
+                lines.append(f"│ {tag} <b>{rec.get('model')}</b>  ⏱ {fmt_dur(el)}")
+            lines.append("╰───────────────╯")
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("⏹ Stop all", callback_data="sc:m:stop"),
+                 InlineKeyboardButton("🔄", callback_data="sc:m:stat")],
+                [InlineKeyboardButton("⬅️ Home", callback_data="sc:m:home")],
+            ])
+            await panel.edit_html(c, "\n".join(lines) + "\n\n" + neon_mon_text(uid), kb)
+            return
+        if data == "sc:m:stop":
+            n = 0
+            for rec_id in list(_USER_RECS.get(uid) or []):
+                rec = _RECS.get(rec_id)
+                if rec:
+                    rec["stop"].set()
+                    n += 1
+            await c.answer(f"stop ×{n}" if n else "koi rec nahi", show_alert=True)
+            return
+        if data == "sc:m:rec":
+            panel.set_wait(uid, "rec")
+            await c.answer()
+            await panel.edit_html(
+                c,
+                "🔴 <b>Record</b> — abhi model naam ya link bhejo.\n⏱ 3 min",
+                InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Home", callback_data="sc:m:home")]]),
+            )
+            return
+        if data == "sc:m:askmon":
+            panel.set_wait(uid, "mon")
+            await c.answer()
+            await panel.edit_html(
+                c,
+                "📌 <b>Monitor add</b> — model naam ya link bhejo.\n"
+                f"slots {len(monitor.slots(uid))}/{config.MAX_MONITORS} · ⏱ 3 min",
+                InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Monitors", callback_data="sc:m:mon")]]),
+            )
+            return
+        if data == "sc:m:live":
+            await c.answer("🔍 live…")
+            async with aiohttp.ClientSession() as session:
+                models, total = await fetch_online_models(session, tag="girls", limit=8, offset=0)
+            if not models:
+                return await c.answer("Live list nahi mili — link paste karo.", show_alert=True)
+            try:
+                await c.message.edit_text(
+                    _browse_text(models, "girls", 0, total),
+                    reply_markup=_browse_kb(models, "girls", 0, total),
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                try:
+                    await c.message.reply_text(
+                        _browse_text(models, "girls", 0, total),
+                        reply_markup=_browse_kb(models, "girls", 0, total),
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    pass
+            return
+        if data.startswith("sc:ad:"):
+            if not is_owner(uid):
+                return await c.answer("Owner only.", show_alert=True)
+            sub = data.split(":", 2)[2]
+            if sub == "home":
+                await c.answer()
+                await panel.edit_html(c, panel.admin_text(), panel.admin_ikb())
+                return
+            if sub == "recs":
+                await c.answer()
+                txt, kb = panel.recs_text_kb()
+                await panel.edit_html(c, txt, kb)
+                return
+            if sub == "mons":
+                await c.answer()
+                txt, kb = panel.mons_text_kb()
+                await panel.edit_html(c, txt, kb)
+                return
+            if sub == "users":
+                await c.answer()
+                await panel.edit_html(
+                    c, panel.users_text(),
+                    InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Admin", callback_data="sc:ad:home")]]),
+                )
+                return
+            if sub == "stopall":
+                n = 0
+                for rec in list(_RECS.values()):
+                    rec["stop"].set()
+                    n += 1
+                await c.answer(f"stopped {n}", show_alert=True)
+                await panel.edit_html(c, panel.admin_text(), panel.admin_ikb())
+                return
+            if sub == "gc":
+                msg = panel.ram_clean()
+                await c.answer(msg[:180], show_alert=True)
+                await panel.edit_html(c, panel.admin_text() + "\n" + msg, panel.admin_ikb())
+                return
+            if sub == "keys":
+                km = load_key_map()
+                lines = [f"<code>{k[:8]}…</code> {'✅' if v else '❌'}" for k, v in list(km.items())[:16]]
+                txt = f"🔑 <b>{len(km)}</b> key pair(s)\n" + ("\n".join(lines) or "empty")
+                await c.answer()
+                await panel.edit_html(
+                    c, txt,
+                    InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Admin", callback_data="sc:ad:home")]]),
+                )
+                return
+            if sub == "cookie":
+                ck = load_sc_cookie()
+                txt = "🍪 Cookie <b>set</b> — group/ticket try OK." if ck else "🍪 Cookie <b>nahi</b> — public HLS only."
+                await c.answer()
+                await panel.edit_html(
+                    c, txt,
+                    InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Admin", callback_data="sc:ad:home")]]),
+                )
+                return
+            if sub.startswith("um:"):
+                rest = sub[3:]
+                uid_s, _, model = rest.partition(":")
+                try:
+                    tu = int(uid_s)
+                except Exception:
+                    return await c.answer("bad uid")
+                monitor.remove(tu, model)
+                await c.answer(f"unmon {model}")
+                txt, kb = panel.mons_text_kb()
+                await panel.edit_html(c, txt, kb)
+                return
+            await c.answer()
+            return
         if data.startswith("sc:q:"):
             # sc:q:model:dur
             _, _, rest = data.partition("sc:q:")
@@ -531,6 +1086,28 @@ async def on_cb(client: Client, c: CallbackQuery):
             dur = int(parts[-2])
             model = ":".join(parts[2:-2])
             return await start_recording(client, c, model, dur, quality)
+        if data.startswith("sc:mon:"):
+            model = data.split(":", 2)[2]
+            ok, msg = monitor.add(uid, model, "source")
+            await c.answer(msg[:180], show_alert=True)
+            try:
+                await c.message.reply_text(neon_mon_text(uid), reply_markup=neon_mon_kb(uid), parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+            return
+        if data.startswith("sc:unmon:"):
+            model = data.split(":", 2)[2]
+            if model.lower() == "all":
+                monitor.clear(uid)
+                await c.answer("all clear")
+            else:
+                monitor.remove(uid, model)
+                await c.answer(f"unmon {model}")
+            try:
+                await c.message.edit_text(neon_mon_text(uid), reply_markup=neon_mon_kb(uid), parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+            return
         if data.startswith("sc:card:"):
             model = data.split(":", 2)[2]
             await c.answer("🔄 …")
@@ -579,6 +1156,8 @@ async def cmd_ping(client: Client, m: Message):
 _KNOWN_CMDS = {
     "start", "help", "ping", "rec", "str", "record", "cam",
     "live", "top", "strtop", "browse", "stop", "mystat", "status", "recstatus", "keys",
+    "mon", "watch", "monitor", "unmon", "unwatch", "mons", "monitors",
+    "admin", "panel", "menu",
 }
 
 
@@ -605,7 +1184,10 @@ def register(app: Client):
     app.add_handler(MessageHandler(cmd_live, priv & _cmd("live", "top", "strtop", "browse")))
     app.add_handler(MessageHandler(cmd_stop, priv & _cmd("stop")))
     app.add_handler(MessageHandler(cmd_stat, priv & _cmd("mystat", "status", "recstatus")))
+    app.add_handler(MessageHandler(cmd_mon, priv & _cmd("mon", "watch", "monitor", "mons", "monitors")))
+    app.add_handler(MessageHandler(cmd_unmon, priv & _cmd("unmon", "unwatch")))
     app.add_handler(MessageHandler(cmd_keys, priv & _cmd("keys")))
+    app.add_handler(MessageHandler(cmd_admin, priv & _cmd("admin", "panel", "menu")))
     app.add_handler(MessageHandler(on_paste, priv & filters.text & ~filters.regex(r"^/")))
     app.add_handler(CallbackQueryHandler(on_cb, filters.regex(r"^sc:")))
     # last: unknown slash commands

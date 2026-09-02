@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import os
+import gc
 import sys
 import time
 import logging
+import asyncio
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -26,6 +28,13 @@ logging.basicConfig(
 )
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 logger = logging.getLogger("sc.bot")
+
+
+def _excepthook(typ, val, tb):
+    logger.error("unhandled", exc_info=(typ, val, tb))
+
+
+sys.excepthook = _excepthook
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -78,6 +87,28 @@ def _cleanup_loop():
                         os.rmdir(p)
                 except Exception:
                     pass
+        try:
+            gc.collect()
+        except Exception:
+            pass
+
+
+async def _monitor_forever(app):
+    import monitor as _mon
+    _mon.load()
+    while True:
+        try:
+            _mon._LOOP_STARTED = False
+            await _mon.run_loop(app)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("monitor loop died — restart 3s")
+        try:
+            gc.collect()
+        except Exception:
+            pass
+        await asyncio.sleep(3)
 
 
 def main():
@@ -100,8 +131,8 @@ def main():
         api_hash=config.API_HASH,
         workers=config.WORKERS,
         workdir=ROOT,
-        max_concurrent_transmissions=4,
-        sleep_threshold=30,
+        max_concurrent_transmissions=2,
+        sleep_threshold=60,
     )
     handlers.register(app)
     from engine import load_key_map
@@ -110,13 +141,39 @@ def main():
         "starting | owner=%s allow_all=%s keys=%s admins=%s",
         config.OWNER_ID, config.ALLOW_ALL, len(km), len(config.ADMIN_IDS),
     )
+    try:
+        loop = asyncio.get_event_loop()
+
+        def _aio_err(loop, context):
+            logger.error("asyncio: %s", context.get("message"), exc_info=context.get("exception"))
+
+        try:
+            loop.set_exception_handler(_aio_err)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
     app.start()
     me = app.get_me()
     logger.info("telegram ok @%s id=%s", me.username, me.id)
-    # health tabhi — crash pe Koyeb ko false-healthy na lage
+    try:
+        asyncio.get_event_loop().create_task(_monitor_forever(app))
+        logger.info("auto-monitor supervisor scheduled")
+    except Exception as e:
+        logger.warning("monitor loop not started: %s", e)
     threading.Thread(target=run_health, daemon=True).start()
-    idle()
-    app.stop()
+    try:
+        idle()
+    except KeyboardInterrupt:
+        logger.info("stop requested")
+    except Exception:
+        logger.exception("idle crash — restart process (Koyeb)")
+        raise
+    try:
+        app.stop()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

@@ -17,7 +17,7 @@ from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 import aiohttp
 
-from config import KEY_FILE, PLAYLIST_POLL, MAX_PLAYLIST_FAILS, PART_MAX_BYTES
+from config import KEY_FILE, PLAYLIST_POLL, MAX_PLAYLIST_FAILS, PART_MAX_BYTES, COOKIE_FILE, STRIPCHAT_COOKIE, ROOT, EDIT_EVERY
 
 logger = logging.getLogger("sc.engine")
 
@@ -30,6 +30,48 @@ HEADERS_PAGE = {
 }
 HEADERS_JSON = {"User-Agent": UA, "Accept": "application/json"}
 HEADERS_CDN = {"User-Agent": UA, "Referer": "https://stripchat.com/", "Origin": "https://stripchat.com"}
+
+
+def load_sc_cookie() -> str:
+    c = (STRIPCHAT_COOKIE or "").strip()
+    if c:
+        return c
+    path = COOKIE_FILE
+    if not os.path.exists(path):
+        path = os.path.join(ROOT, "cookies.txt")
+    if not os.path.exists(path):
+        return ""
+    try:
+        raw = open(path, encoding="utf-8").read().strip()
+        if not raw or raw.startswith("# Netscape") or "\t" in raw:
+            parts = []
+            for line in raw.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                cols = line.split("\t")
+                if len(cols) >= 7:
+                    parts.append(f"{cols[5]}={cols[6]}")
+            return "; ".join(parts)
+        return raw.replace("\n", " ").strip()
+    except Exception:
+        return ""
+
+
+def cdn_headers() -> dict:
+    h = dict(HEADERS_CDN)
+    ck = load_sc_cookie()
+    if ck:
+        h["Cookie"] = ck
+    return h
+
+
+def page_headers() -> dict:
+    h = dict(HEADERS_PAGE)
+    ck = load_sc_cookie()
+    if ck:
+        h["Cookie"] = ck
+    return h
 
 # Same Mouflon/doppio stack
 HOST_NEEDLES = (
@@ -139,7 +181,7 @@ def _json_object_at(s: str, start: int = 0):
 
 
 async def aget(session, url, headers=None, timeout=25, binary=False):
-    h = dict(HEADERS_PAGE)
+    h = page_headers()
     if headers:
         h.update(headers)
     try:
@@ -367,7 +409,7 @@ async def fetch_model_status(session, username: str) -> dict:
     if st.get("id"):
         master = await fetch_master(session, int(st["id"]))
         if master:
-            st["online"] = True if not st.get("private") else st["online"]
+            st["online"] = True
             inf = re.findall(r'RESOLUTION=(\d+x\d+).*NAME="([^"]+)"', master)
             if inf:
                 st["hd"] = any(int(r.split("x")[0]) >= 720 for r, _n in inf)
@@ -381,10 +423,31 @@ async def fetch_model_status(session, username: str) -> dict:
 async def fetch_master(session, model_id: int) -> str | None:
     for host in CDN_HOSTS:
         url = f"https://edge-hls.{host}/hls/{model_id}/master/{model_id}_auto.m3u8"
-        code, txt = await aget(session, url, headers=HEADERS_CDN, timeout=12)
+        code, txt = await aget(session, url, headers=cdn_headers(), timeout=12)
         if code == 200 and txt and "#EXT" in txt:
             return txt
     return None
+
+
+async def is_hls_live(session, model_id: int, timeout: float = 3.0) -> bool:
+    """Fast online ping — master only, no HTML. Decrypt/CDN path unchanged."""
+    try:
+        mid = int(model_id or 0)
+    except Exception:
+        return False
+    if mid <= 0:
+        return False
+    for host in CDN_HOSTS[:3]:
+        url = f"https://edge-hls.{host}/hls/{mid}/master/{mid}_auto.m3u8"
+        try:
+            code, txt = await aget(session, url, headers=cdn_headers(), timeout=timeout)
+        except Exception:
+            continue
+        if code == 200 and isinstance(txt, str) and "#EXT" in txt:
+            if "MOUFLON-ADVERT" in txt and "MOUFLON:URI:" not in txt:
+                return False
+            return True
+    return False
 
 
 async def playlist_and_keys(session, model_id: int, quality: str = "source"):
@@ -397,16 +460,36 @@ async def playlist_and_keys(session, model_id: int, quality: str = "source"):
     variants = parse_variants(master)
     if not variants:
         raise MouflonError("Master playlist me variants nahi mile.")
-    want = (quality or "source").lower()
+    want = (quality or "source").lower().replace(" ", "")
     chosen = None
     for v in variants:
-        if v["name"].lower() == want:
+        if v["name"].lower().replace(" ", "") == want:
             chosen = v
             break
-    if chosen is None and want in ("480", "480p"):
-        chosen = next((v for v in variants if "480" in v["name"].lower()), None)
-    if chosen is None and want in ("240", "240p"):
-        chosen = next((v for v in variants if "240" in v["name"].lower()), None)
+    def _by_res(pred):
+        for v in variants:
+            r = v.get("res") or ""
+            try:
+                w = int(r.split("x")[0])
+            except Exception:
+                w = 0
+            name = v["name"].lower()
+            if pred(w, name):
+                return v
+        return None
+    if chosen is None:
+        if want in ("source", "best", "orig", "hd"):
+            chosen = variants[0]
+        elif want in ("720", "720p"):
+            chosen = _by_res(lambda w, n: w == 720 or "720" in n) or variants[0]
+        elif want in ("480", "480p"):
+            chosen = _by_res(lambda w, n: w == 480 or "480" in n)
+        elif want in ("360", "360p"):
+            chosen = _by_res(lambda w, n: w == 360 or "360" in n)
+        elif want in ("240", "240p"):
+            chosen = _by_res(lambda w, n: w == 240 or "240" in n)
+        elif want in ("160", "160p"):
+            chosen = _by_res(lambda w, n: w == 160 or "160" in n)
     if chosen is None:
         chosen = variants[0]
     return chosen["url"], psch, pkey, variants, chosen
@@ -434,9 +517,14 @@ async def get_pdkey(session, sample_enc: str, pkey: str | None = None) -> str:
 
 async def fetch_live_segments(session, variant_url, psch, pkey, pdkey):
     vurl = add_query(variant_url, psch=psch, pkey=pkey)
-    code, pl = await aget(session, vurl, headers=HEADERS_CDN, timeout=15)
+    code, pl = await aget(session, vurl, headers=cdn_headers(), timeout=15)
     if code == 403:
-        raise MouflonError("Live playlist 403 — private/group show ya geo-block.")
+        ck = "cookie set" if load_sc_cookie() else "no cookie"
+        raise MouflonError(
+            f"Live playlist 403 ({ck}). Group/ticket/private HLS lock. "
+            "Logged-in Stripchat cookie chahiye (`STRIPCHAT_COOKIE` / cookies.txt) "
+            "jo us show ka access rakhe."
+        )
     if code != 200 or not pl:
         raise MouflonError(f"live playlist HTTP {code}")
     if "MOUFLON-ADVERT" in pl or ("ENDLIST" in pl and "MOUFLON:URI:" not in pl):
@@ -540,6 +628,11 @@ async def make_thumb(path: str, dest: str) -> str | None:
 def cleanup_dir(path: str):
     if path and os.path.isdir(path):
         shutil.rmtree(path, ignore_errors=True)
+    try:
+        import gc
+        gc.collect()
+    except Exception:
+        pass
 
 
 async def record_to_parts(session, model: str, model_id: int, quality: str,
@@ -552,9 +645,14 @@ async def record_to_parts(session, model: str, model_id: int, quality: str,
     """
     variant_url, psch, pkey, _vars, chosen = await playlist_and_keys(session, model_id, quality)
     vurl = add_query(variant_url, psch=psch, pkey=pkey)
-    code, pl0 = await aget(session, vurl, headers=HEADERS_CDN, timeout=15)
+    code, pl0 = await aget(session, vurl, headers=cdn_headers(), timeout=15)
     if code == 403:
-        raise MouflonError("Live playlist 403 — private/group show. Public hone pe try karo.")
+        ck = "cookie set" if load_sc_cookie() else "no cookie"
+        raise MouflonError(
+            f"Live playlist 403 ({ck}). Group/ticket/private lock. "
+            "Koyeb pe `STRIPCHAT_COOKIE` ya `cookies.txt` daalo (logged-in account "
+            "jiske paas ye show hai)."
+        )
     if code != 200 or not pl0:
         raise MouflonError(f"Live playlist nahi khuli (HTTP {code})")
     if "MOUFLON-ADVERT" in pl0 or ("ENDLIST" in pl0 and "MOUFLON:URI:" not in pl0):
@@ -609,7 +707,7 @@ async def record_to_parts(session, model: str, model_id: int, quality: str,
         nonlocal cur_bytes, init_written
         if init_written or not init_url_global[0] or not cur_fh:
             return
-        _, data = await aget(session, init_url_global[0], headers=HEADERS_CDN, binary=True)
+        _, data = await aget(session, init_url_global[0], headers=cdn_headers(), binary=True)
         if data:
             cur_fh.write(data)
             cur_bytes += len(data)
@@ -658,14 +756,14 @@ async def record_to_parts(session, model: str, model_id: int, quality: str,
                     _close_part()
                     _open_part()
                     await _write_init()
-                _, data = await aget(session, segs[k], headers=HEADERS_CDN, binary=True, timeout=30)
+                _, data = await aget(session, segs[k], headers=cdn_headers(), binary=True, timeout=30)
                 if data and len(data) > 100:
                     cur_fh.write(data)
                     done_keys.add(k)
                     total_bytes += len(data)
                     cur_bytes += len(data)
             now = time.time()
-            if on_tick and now - last_tick >= 8:
+            if on_tick and now - last_tick >= EDIT_EVERY:
                 last_tick = now
                 el = int(now - started)
                 left = int(deadline - now) if dur_seconds else None

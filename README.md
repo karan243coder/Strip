@@ -11,7 +11,7 @@ Sirf **Stripchat family live cam record**. BIMBO / JAV / TeraBox / torrent nahi.
 - 1 / 5 / 10 / 30 min + Until Stop
 - Mouflon v2 (`keys.txt`)
 - Multi-CDN HLS, ffmpeg remux + thumb, Telegram upload
-- Private / group-show coming soon
+- Private / group-show pe record nahi (HTTP 403)
 
 ---
 
@@ -80,9 +80,16 @@ cp .env.example .env   # values bharo
 python bot.py
 ```
 
-## Commands
-`/start` `/rec Model` `/live` `/stop` `/mystat`  
-Owner: `/keys`
+## Buttons (main)
+`/start` pe panel + neeche keyboard: **Live · Monitor · Record · Stop · Status · Menu**. Owner ko **🔐 Admin**.
+
+Admin: health, all recs, all monitors add/remove, stop-all, RAM clean, keys, cookie, users.
+
+Commands optional: `/rec` `/live` `/mon` `/stop` `/admin`
+
+Koyeb pe 2 models ek saath: `SC_MAX_REC=2` (ya 3). Nano pe RAM tight ho to 1 hi rec rakho.
+
+Monitor HLS ping ~0.8s — online aate hi rec. Telegram FloodWait pe rec **nahi rukti** (progress edit skip). Rec/upload khatam → files + `gc` se RAM wapas.
 
 ## Access
 Default: `SC_OWNER_ID` + `SC_ADMIN_IDS` + `SC_ALLOWED_USERS`.  

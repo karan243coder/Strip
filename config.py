@@ -69,13 +69,19 @@ if not OWNER_ID and not ALLOWED_USERS and not ADMIN_IDS:
 
 DOWNLOAD_DIR = _str("SC_DOWNLOAD_DIR") or os.path.join(ROOT, "downloads")
 KEY_FILE = _str("STRIPCHAT_KEY_FILE") or os.path.join(ROOT, "keys.txt")
+COOKIE_FILE = _str("STRIPCHAT_COOKIE_FILE") or os.path.join(ROOT, "cookies.txt")
+STRIPCHAT_COOKIE = _str("STRIPCHAT_COOKIE") or _str("SC_COOKIE")
 
 MAX_CONCURRENT_REC = max(1, _int("SC_MAX_REC", 3))
-MAX_REC_PER_USER = 1
+MAX_REC_PER_USER = max(1, min(2, _int("SC_MAX_REC_PER_USER", 2)))
+MAX_MONITORS = 2
+# sub-second poll = online detect ~1s; FloodWait se bachne ke liye TG edits alag throttle
+MONITOR_POLL = max(0.6, float(_str("SC_MONITOR_POLL", "0.8") or "0.8"))
+MONITOR_COOLDOWN = max(1, _int("SC_MONITOR_COOLDOWN", 2))
 PART_MAX_BYTES = _int("SC_PART_MAX", 1850 * 1024 * 1024)
 UNTIL_STOP_CAP_MIN = max(5, _int("SC_UNTIL_STOP_CAP_MIN", 180))
 PLAYLIST_POLL = float(_str("SC_PLAYLIST_POLL", "2.0") or "2.0")
-EDIT_EVERY = 8.0
+EDIT_EVERY = 10.0
 MAX_PLAYLIST_FAILS = 8
 WORKERS = max(1, _int("SC_WORKERS", 4))
 PORT = _int("PORT", 8080)
