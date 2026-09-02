@@ -1,7 +1,5 @@
 # Stripchat Live Recorder Bot
 
-Sirf **Stripchat family live cam record**. BIMBO / JAV / TeraBox / torrent nahi.
-
 **Domains:** stripchat.com · superchatlive.com · xhamsterlive.com · strip.chat
 
 ## Features
@@ -11,7 +9,7 @@ Sirf **Stripchat family live cam record**. BIMBO / JAV / TeraBox / torrent nahi.
 - 1 / 5 / 10 / 30 min + Until Stop
 - Mouflon v2 (`keys.txt`)
 - Multi-CDN HLS, ffmpeg remux + thumb, Telegram upload
-- Private / group-show pe record nahi (HTTP 403)
+- Private / group-show comming soon 🔜 
 
 ---
 
@@ -48,6 +46,8 @@ git push -u origin main
 | `SC_API_ID` | my.telegram.org se |
 | `SC_API_HASH` | my.telegram.org se |
 | `SC_OWNER_ID` | tumhara Telegram numeric id |
+   SC_MAX_REC=2
+   SC_MAX_REC_PER_USER=2
 
 Optional:
 
